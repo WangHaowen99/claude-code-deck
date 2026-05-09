@@ -1,0 +1,138 @@
+{
+  "name": "claude-code-deck",
+  "displayName": "Claude Code Deck",
+  "description": "Manage Claude Code Deck sessions from the VS Code sidebar.",
+  "version": "0.1.0",
+  "publisher": "claude-code-deck",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onView:claudeCodeDeck.sessions",
+    "onCommand:claudeCodeDeck.refresh",
+    "onCommand:claudeCodeDeck.newSession",
+    "onCommand:claudeCodeDeck.openSession",
+    "onCommand:claudeCodeDeck.deleteSession",
+    "onCommand:claudeCodeDeck.renameSession",
+    "onCommand:claudeCodeDeck.copyUuid"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Claude Code Deck",
+      "properties": {
+        "claudeCodeDeck.ccdPath": {
+          "type": "string",
+          "default": "ccd",
+          "description": "Path to the ccd executable on the remote/workspace host."
+        },
+        "claudeCodeDeck.defaultCwd": {
+          "type": "string",
+          "default": "",
+          "description": "Default working directory for new Claude Code Deck sessions. Empty uses the first workspace folder or the remote home directory."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claudeCodeDeck",
+          "title": "Claude Code Deck",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claudeCodeDeck": [
+        {
+          "id": "claudeCodeDeck.sessions",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "claudeCodeDeck.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeCodeDeck.newSession",
+        "title": "New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "claudeCodeDeck.openSession",
+        "title": "Open Session",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "claudeCodeDeck.renameSession",
+        "title": "Rename Session",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "claudeCodeDeck.deleteSession",
+        "title": "Delete Session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claudeCodeDeck.copyUuid",
+        "title": "Copy Claude Code Session ID",
+        "icon": "$(copy)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "claudeCodeDeck.newSession",
+          "when": "view == claudeCodeDeck.sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeCodeDeck.refresh",
+          "when": "view == claudeCodeDeck.sessions",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claudeCodeDeck.openSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeCodeDeck.renameSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeCodeDeck.copyUuid",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "navigation@2"
+        },
+        {
+          "command": "claudeCodeDeck.deleteSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "navigation@9"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.86.0",
+    "typescript": "^5.3.3"
+  }
+}

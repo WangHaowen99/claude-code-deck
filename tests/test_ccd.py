@@ -1,0 +1,195 @@
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CCD_PATH = ROOT / "ccd"
+
+
+def load_ccd():
+    loader = SourceFileLoader("ccd_module", str(CCD_PATH))
+    spec = importlib.util.spec_from_loader("ccd_module", loader)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class CcdTests(unittest.TestCase):
+    def setUp(self):
+        self.ccd = load_ccd()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.configure_paths()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def configure_paths(self):
+        ccd = self.ccd
+        ccd.CONFIG_DIR = self.root / "config"
+        ccd.DATA_DIR = self.root / "data"
+        ccd.STATE_DIR = self.root / "state"
+        ccd.CONFIG_PATH = ccd.CONFIG_DIR / "config.json"
+        ccd.REGISTRY_PATH = ccd.DATA_DIR / "sessions.json"
+        ccd.LOCK_PATH = ccd.STATE_DIR / "lock"
+        ccd.LOG_PATH = ccd.STATE_DIR / "ccd.log"
+        ccd.CLAUDE_HOME = self.root / "claude"
+        ccd.CLAUDE_SETTINGS_PATH = ccd.CLAUDE_HOME / "settings.json"
+        ccd.CLAUDE_HISTORY_PATH = ccd.CLAUDE_HOME / "history.jsonl"
+        ccd.CLAUDE_PROJECTS_DIR = ccd.CLAUDE_HOME / "projects"
+
+    def test_install_settings_hook_preserves_settings_and_replaces_old_ccd_hook(self):
+        self.ccd.CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True)
+        self.ccd.CLAUDE_SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "theme": "dark",
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "matcher": "old",
+                                "hooks": [{"type": "command", "command": "/old/ccd __hook-session-start"}],
+                            },
+                            {
+                                "matcher": ".*",
+                                "hooks": [{"type": "command", "command": "echo keep"}],
+                            },
+                        ]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.ccd.current_ccd_path = lambda: "/tmp/bin/ccd"
+
+        self.ccd.install_settings_hook()
+
+        settings = json.loads(self.ccd.CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(settings["theme"], "dark")
+        groups = settings["hooks"]["SessionStart"]
+        commands = [hook["command"] for group in groups for hook in group["hooks"]]
+        self.assertIn("echo keep", commands)
+        self.assertEqual(commands.count("/tmp/bin/ccd __hook-session-start"), 1)
+        self.assertEqual(groups[-1]["matcher"], "^(startup|resume)$")
+
+    def test_session_start_hook_records_claude_session(self):
+        self.ccd.ensure_dirs()
+        registry = {
+            "version": self.ccd.VERSION,
+            "sessions": [
+                {
+                    "id": "deck1",
+                    "name": "work",
+                    "tmux_session": "ccd_deck1",
+                    "claude_session_id": None,
+                    "last_cwd": str(self.root),
+                    "created_at": "2026-05-09T00:00:00Z",
+                    "updated_at": "2026-05-09T00:00:00Z",
+                    "last_used_at": "2026-05-09T00:00:00Z",
+                    "transcript_path": None,
+                }
+            ],
+        }
+        self.ccd.save_registry(registry)
+        payload = {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "cwd": str(self.root / "project"),
+            "transcript_path": str(self.root / "project.jsonl"),
+            "source": "startup",
+        }
+
+        with mock.patch.dict(os.environ, {"CCD_SESSION_ID": "deck1"}), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))):
+            rc = self.ccd.cmd_hook_session_start([])
+
+        self.assertEqual(rc, 0)
+        saved = self.ccd.load_registry()["sessions"][0]
+        self.assertEqual(saved["claude_session_id"], payload["session_id"])
+        self.assertEqual(saved["last_cwd"], payload["cwd"])
+        self.assertEqual(saved["transcript_path"], payload["transcript_path"])
+
+    def test_load_claude_sessions_reads_history_and_project_transcripts(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        self.ccd.CLAUDE_HISTORY_PATH.parent.mkdir(parents=True)
+        self.ccd.CLAUDE_HISTORY_PATH.write_text(
+            json.dumps({"sessionId": sid, "display": "build a deck", "timestamp": 1778240000000, "project": str(self.root / "repo")}) + "\n",
+            encoding="utf-8",
+        )
+        transcript_dir = self.ccd.CLAUDE_PROJECTS_DIR / "-root-repo"
+        transcript_dir.mkdir(parents=True)
+        transcript_path = transcript_dir / f"{sid}.jsonl"
+        transcript_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "permission-mode", "sessionId": sid}),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": sid,
+                            "cwd": str(self.root / "repo"),
+                            "timestamp": "2026-05-09T01:02:03Z",
+                            "message": {"role": "user", "content": "hello from transcript"},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        sessions = self.ccd.load_claude_sessions()
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].id, sid)
+        self.assertEqual(sessions[0].title, "build a deck")
+        self.assertEqual(sessions[0].cwd, str(self.root / "repo"))
+        self.assertEqual(sessions[0].transcript_path, str(transcript_path))
+        self.assertEqual(sessions[0].updated_at, "2026-05-09T01:02:03Z")
+
+    def test_runner_uses_claude_resume_option_for_bound_session(self):
+        self.ccd.ensure_dirs()
+        sid = "33333333-3333-4333-8333-333333333333"
+        self.ccd.save_registry(
+            {
+                "version": self.ccd.VERSION,
+                "sessions": [
+                    {
+                        "id": "deck1",
+                        "name": "work",
+                        "tmux_session": "ccd_deck1",
+                        "claude_session_id": sid,
+                        "last_cwd": str(self.root),
+                        "created_at": "2026-05-09T00:00:00Z",
+                        "updated_at": "2026-05-09T00:00:00Z",
+                        "last_used_at": "2026-05-09T00:00:00Z",
+                        "transcript_path": None,
+                    }
+                ],
+            }
+        )
+        seen = []
+
+        def fake_run(args, env=None):
+            seen.append((args, env))
+            return subprocess.CompletedProcess(args, 0)
+
+        with mock.patch.object(self.ccd.subprocess, "run", fake_run):
+            rc = self.ccd.cmd_runner(["deck1"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen[0][0], ["claude", "--resume", sid])
+        self.assertEqual(seen[0][1]["CCD_SESSION_ID"], "deck1")
+
+
+if __name__ == "__main__":
+    unittest.main()

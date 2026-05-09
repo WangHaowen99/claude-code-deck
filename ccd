@@ -1,0 +1,2133 @@
+#!/usr/bin/env python3
+"""Claude Code Deck: manage Claude Code CLI sessions through tmux."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+APP_NAME = "Claude Code Deck"
+APP_ID = "ccd"
+VERSION = 1
+MAX_NAME_LEN = 60
+RAW_IMPORT_PREVIEW_LIMIT = 30
+CCD_HOOK_STATUS = "ccd session mapping"
+COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+ASCII_BANNER = [
+    "  ____          _             ____            _    ",
+    " / ___|___   __| | _____  __ |  _ \\  ___  ___| | __",
+    "| |   / _ \\ / _` |/ _ \\ \\/ / | | | |/ _ \\/ __| |/ /",
+    "| |__| (_) | (_| |  __/>  <  | |_| |  __/ (__|   < ",
+    " \\____\\___/ \\__,_|\\___/_/\\_\\ |____/ \\___|\\___|_|\\_\\",
+]
+ASCII_BANNER_NARROW = [
+    "  ____          _            ",
+    " / ___|___   __| | _____  __",
+    "| |   / _ \\ / _` |/ _ \\ \\/ /",
+    "| |__| (_) | (_| |  __/>  < ",
+    " \\____\\___/ \\__,_|\\___/_/\\_\\",
+    "      ____            _     ",
+    "     |  _ \\  ___  ___| | __ ",
+    "     | | | |/ _ \\/ __| |/ / ",
+    "     | |_| |  __/ (__|   <  ",
+    "     |____/ \\___|\\___|_|\\_\\ ",
+]
+
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state"))
+
+CONFIG_DIR = CONFIG_HOME / APP_ID
+DATA_DIR = DATA_HOME / APP_ID
+STATE_DIR = STATE_HOME / APP_ID
+CONFIG_PATH = CONFIG_DIR / "config.json"
+REGISTRY_PATH = DATA_DIR / "sessions.json"
+LOCK_PATH = STATE_DIR / "lock"
+LOG_PATH = STATE_DIR / "ccd.log"
+
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
+CLAUDE_SETTINGS_PATH = CLAUDE_HOME / "settings.json"
+CLAUDE_HISTORY_PATH = CLAUDE_HOME / "history.jsonl"
+CLAUDE_PROJECTS_DIR = CLAUDE_HOME / "projects"
+
+
+class CcdError(Exception):
+    pass
+
+
+@dataclass
+class RawClaudeSession:
+    id: str
+    title: str
+    updated_at: str | None = None
+    cwd: str | None = None
+    transcript_path: str | None = None
+
+
+def color(text: str, code: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def bold(text: str) -> str:
+    return color(text, "1")
+
+
+def dim(text: str) -> str:
+    return color(text, "2")
+
+
+def green(text: str) -> str:
+    return color(text, "32")
+
+
+def yellow(text: str) -> str:
+    return color(text, "33")
+
+
+def red(text: str) -> str:
+    return color(text, "31")
+
+
+def cyan(text: str) -> str:
+    return color(text, "36")
+
+
+def ui_width() -> int:
+    columns = shutil.get_terminal_size((72, 20)).columns
+    return max(44, min(columns, 104))
+
+
+def rule() -> str:
+    return dim("─" * ui_width())
+
+
+def display_len(text: str) -> int:
+    width = 0
+    for ch in text:
+        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+    return width
+
+
+def pad_display(text: str, width: int) -> str:
+    return text + " " * max(0, width - display_len(text))
+
+
+def print_banner() -> None:
+    terminal_width = ui_width()
+    banner = ASCII_BANNER if terminal_width >= 70 else ASCII_BANNER_NARROW
+    width = max(terminal_width, max(display_len(line) for line in banner))
+    for line in banner:
+        print(cyan(line.center(width)))
+
+
+def print_header(title: str, subtitle: str | None = None, *, banner: bool = False) -> None:
+    print()
+    if banner:
+        print_banner()
+        print()
+    print(bold(title))
+    if subtitle:
+        print(dim(subtitle))
+    print(rule())
+
+
+def print_empty(message: str) -> None:
+    print(dim(f"  {message}"))
+
+
+def prompt(message: str) -> str:
+    return input(cyan("› ") + message).strip()
+
+
+def status_text(value: str) -> str:
+    if value == "live":
+        return green("live")
+    if value == "bound":
+        return cyan("bound")
+    if value in {"unbound", "warn"}:
+        return yellow(value)
+    if value in {"err", "error"}:
+        return red(value)
+    return dim(value)
+
+
+def print_menu(title: str, items: list[tuple[str, str, str]], subtitle: str | None = None, *, banner: bool = False) -> None:
+    print_header(title, subtitle, banner=banner)
+    width = ui_width()
+    desktop = width >= 78
+    label_width = min(22, max((display_len(label) for _, label, _ in items), default=0))
+    for key, label, desc in items:
+        key_text = cyan(f"{key:>2}")
+        if desktop:
+            label_text = bold(pad_display(label, label_width))
+            desc_text = dim(desc)
+            print(f"  {key_text}  {label_text}      {desc_text}")
+        else:
+            label_text = bold(label)
+            print(f"  {key_text}  {label_text}")
+            if desc:
+                print(f"      {dim(desc)}")
+            print()
+    print(rule())
+
+
+def ensure_dirs() -> None:
+    for path in (CONFIG_DIR, DATA_DIR, STATE_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def backup_suffix() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def log_event(message: str) -> None:
+    try:
+        ensure_dirs()
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"{now_utc()} {message}\n")
+    except OSError:
+        pass
+
+
+@contextmanager
+def registry_lock():
+    ensure_dirs()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return default
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json_atomic(path: Path, data: dict[str, Any], *, backup: bool = False, timestamped: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and backup:
+        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        if timestamped:
+            shutil.copy2(path, path.with_suffix(path.suffix + f".bak.{backup_suffix()}"))
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def default_config() -> dict[str, Any]:
+    return {
+        "version": VERSION,
+        "roots": [
+            {
+                "id": "home",
+                "name": "home",
+                "path": str(HOME),
+            }
+        ],
+    }
+
+
+def default_registry() -> dict[str, Any]:
+    return {"version": VERSION, "sessions": []}
+
+
+def load_config() -> dict[str, Any]:
+    data = load_json(CONFIG_PATH, default_config())
+    if data.get("version") != VERSION:
+        raise CcdError(f"不支持的配置版本: {data.get('version')}")
+    data.setdefault("roots", [])
+    return data
+
+
+def save_config(config: dict[str, Any]) -> None:
+    config["version"] = VERSION
+    write_json_atomic(CONFIG_PATH, config, backup=CONFIG_PATH.exists())
+
+
+def load_registry() -> dict[str, Any]:
+    data = load_json(REGISTRY_PATH, default_registry())
+    if data.get("version") != VERSION:
+        raise CcdError(f"不支持的注册表版本: {data.get('version')}")
+    data.setdefault("sessions", [])
+    return data
+
+
+def save_registry(registry: dict[str, Any], *, timestamped_backup: bool = False) -> None:
+    registry["version"] = VERSION
+    write_json_atomic(REGISTRY_PATH, registry, backup=REGISTRY_PATH.exists(), timestamped=timestamped_backup)
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    match = re.match(r"^(.*T\d\d:\d\d:\d\d)\.(\d+)([+-]\d\d:\d\d)$", text)
+    if match:
+        text = f"{match.group(1)}.{match.group(2)[:6]:<06}{match.group(3)}"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def display_time(value: str | None) -> str:
+    dt = parse_iso(value)
+    if not dt:
+        return "--"
+    return dt.astimezone().strftime("%m-%d %H:%M")
+
+
+def sort_key_time(value: str | None) -> float:
+    dt = parse_iso(value)
+    return dt.timestamp() if dt else 0.0
+
+
+def require_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        raise CcdError(f"未找到 {name}，请先安装。")
+
+
+def validate_name(raw: str) -> str:
+    name = raw.strip()
+    if not name:
+        raise CcdError("ccd_name 不能为空。")
+    if len(name) > MAX_NAME_LEN:
+        raise CcdError(f"ccd_name 最长 {MAX_NAME_LEN} 个字符。")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise CcdError("ccd_name 不能包含控制字符。")
+    return name
+
+
+def validate_root_name(raw: str) -> str:
+    name = raw.strip()
+    if not name:
+        raise CcdError("root 名不能为空。")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise CcdError("root 名不能包含控制字符。")
+    return name
+
+
+def normalize_path(raw: str) -> Path:
+    return Path(raw).expanduser().resolve(strict=False)
+
+
+def validate_child_path(raw: str) -> Path | None:
+    text = raw.strip()
+    if not text:
+        return None
+    candidate = Path(text)
+    if candidate.is_absolute():
+        raise CcdError("新建文件夹名不能是绝对路径。")
+    if ".." in candidate.parts:
+        raise CcdError("新建文件夹名不能包含 '..'。")
+    if any(part == "" for part in candidate.parts):
+        raise CcdError("新建文件夹名不合法。")
+    return candidate
+
+
+def unique_session_id(registry: dict[str, Any]) -> str:
+    existing = {s["id"] for s in registry.get("sessions", [])}
+    for _ in range(20):
+        sid = secrets.token_hex(4)
+        if sid not in existing and not tmux_exists(f"ccd_{sid}"):
+            return sid
+    raise CcdError("无法生成唯一内部 id。")
+
+
+def find_session_by_name(registry: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for session in registry.get("sessions", []):
+        if session.get("name") == name:
+            return session
+    return None
+
+
+def find_session_by_id(registry: dict[str, Any], session_id: str) -> dict[str, Any] | None:
+    for session in registry.get("sessions", []):
+        if session.get("id") == session_id:
+            return session
+    return None
+
+
+def find_session_by_claude_id(registry: dict[str, Any], claude_id: str) -> dict[str, Any] | None:
+    for session in registry.get("sessions", []):
+        if session.get("claude_session_id") == claude_id:
+            return session
+    return None
+
+
+def tmux_exists(name: str) -> bool:
+    if shutil.which("tmux") is None:
+        return False
+    result = subprocess.run(["tmux", "has-session", "-t", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
+def tmux_status(session: dict[str, Any]) -> str:
+    return "live" if tmux_exists(session["tmux_session"]) else "exited"
+
+
+def configure_tmux_session(tmux_name: str) -> None:
+    if shutil.which("tmux") is None:
+        return
+    configure_tmux_server()
+    options = [
+        ("mouse", "on"),
+        ("remain-on-exit", "off"),
+        ("@ccd_scroll_mode", "tmux-copy-mode"),
+    ]
+    for option, value in options:
+        result = subprocess.run(
+            ["tmux", "set-option", "-q", "-t", tmux_name, option, value],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            log_event(f"tmux option failed session={tmux_name} option={option} value={value}: {result.stderr.strip()}")
+    install_tmux_mouse_bindings()
+
+
+def configure_tmux_server() -> None:
+    if shutil.which("tmux") is None:
+        return
+    result = subprocess.run(
+        ["tmux", "set-option", "-gq", "mouse", "on"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        log_event(f"tmux global mouse option failed: {result.stderr.strip()}")
+
+
+def install_tmux_mouse_bindings() -> None:
+    if shutil.which("tmux") is None:
+        return
+    bindings = [
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "WheelUpPane",
+            "if-shell",
+            "-F",
+            "-t",
+            "=",
+            "#{==:#{@ccd_scroll_mode},tmux-copy-mode}",
+            "if-shell -F -t = '#{pane_in_mode}' 'send-keys -M' 'copy-mode -e -t ='",
+            "if-shell -F -t = '#{||:#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M' 'copy-mode -e -t ='",
+        ],
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "WheelDownPane",
+            "if-shell",
+            "-F",
+            "-t",
+            "=",
+            "#{==:#{@ccd_scroll_mode},tmux-copy-mode}",
+            "if-shell -F -t = '#{pane_in_mode}' 'send-keys -M'",
+            "send-keys -M",
+        ],
+    ]
+    for binding in bindings:
+        result = subprocess.run(
+            ["tmux", *binding],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            log_event(f"tmux mouse binding failed: {' '.join(binding)}: {result.stderr.strip()}")
+
+
+def sorted_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(
+        registry.get("sessions", []),
+        key=lambda s: (sort_key_time(s.get("last_used_at")) or sort_key_time(s.get("created_at")), s.get("name", "")),
+        reverse=True,
+    )
+
+
+def short_text(text: str | None, max_len: int = 28) -> str:
+    if not text:
+        return ""
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def short_display_text(text: str | None, max_width: int) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if not cleaned or max_width <= 0:
+        return ""
+    if display_len(cleaned) <= max_width:
+        return cleaned
+    if max_width <= 1:
+        return "…"
+    limit = max_width - 1
+    width = 0
+    pieces: list[str] = []
+    for ch in cleaned:
+        ch_width = 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+        if width + ch_width > limit:
+            break
+        pieces.append(ch)
+        width += ch_width
+    trimmed = "".join(pieces).rstrip()
+    return (trimmed + "…") if trimmed else "…"
+
+
+def compact_uuid(text: str | None) -> str:
+    if not text:
+        return ""
+    value = text.strip()
+    if len(value) <= 15:
+        return value
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def normalize_preview_text(text: str | None) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def user_visible_conversation_text(text: str | None) -> str:
+    cleaned = normalize_preview_text(text)
+    if not cleaned:
+        return ""
+    internal_prefixes = (
+        "<environment_context>",
+        "<permissions instructions>",
+        "<collaboration_mode>",
+        "<skills_instructions>",
+        "<local-command-caveat>",
+        "<command-name>",
+        "<local-command-stdout>",
+    )
+    return "" if cleaned.startswith(internal_prefixes) else cleaned
+
+
+def extract_message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    pieces = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"input_text", "output_text", "text"}:
+            text = item.get("text")
+            if isinstance(text, str):
+                pieces.append(text)
+    return " ".join(pieces)
+
+
+def extract_claude_message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    return extract_message_content_text(message.get("content"))
+
+
+def timestamp_to_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if parse_iso(value):
+            return value
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)):
+        seconds = float(value) / 1000 if float(value) > 10_000_000_000 else float(value)
+        return datetime.fromtimestamp(seconds, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return None
+
+
+def print_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    sessions = sorted_sessions(registry)
+    if not sessions:
+        print_empty("当前没有 ccd 会话。")
+        return []
+    print_header("ccd 会话", "按最近使用时间排序；live 表示 tmux 现场仍在运行。")
+    for i, session in enumerate(sessions, start=1):
+        status = tmux_status(session)
+        bound = "bound" if session.get("claude_session_id") else "unbound"
+        used = display_time(session.get("last_used_at") or session.get("created_at"))
+        name = short_text(session.get("name"), 30)
+        print(f"  {cyan(str(i).rjust(2))}  {bold(name)}")
+        print(f"      {status_text(status)}  {status_text(bound)}  {dim(used)}")
+    return sessions
+
+
+def emit_json(data: dict[str, Any]) -> None:
+    json.dump(data, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+
+
+def session_json(session: dict[str, Any], *, include_status: bool = True) -> dict[str, Any]:
+    data = {
+        "id": session.get("id"),
+        "name": session.get("name"),
+        "tmux_session": session.get("tmux_session"),
+        "claude_session_id": session.get("claude_session_id"),
+        "bound": bool(session.get("claude_session_id")),
+        "last_cwd": session.get("last_cwd"),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+        "last_used_at": session.get("last_used_at"),
+        "transcript_path": session.get("transcript_path"),
+    }
+    if include_status:
+        data["tmux_status"] = tmux_status(session)
+    return data
+
+
+def print_error(message: str, *, json_mode: bool = False) -> None:
+    if json_mode:
+        emit_json({"ok": False, "error": message})
+    else:
+        print(red(message))
+
+
+def take_flag(args: list[str], flag: str) -> bool:
+    found = False
+    kept = []
+    for arg in args:
+        if arg == flag:
+            found = True
+        else:
+            kept.append(arg)
+    args[:] = kept
+    return found
+
+
+def take_option(args: list[str], option: str) -> str | None:
+    for i, arg in enumerate(list(args)):
+        if arg == option:
+            if i + 1 >= len(args):
+                raise CcdError(f"{option} 需要参数。")
+            value = args[i + 1]
+            del args[i : i + 2]
+            return value
+        prefix = option + "="
+        if arg.startswith(prefix):
+            value = arg[len(prefix) :]
+            del args[i]
+            return value
+    return None
+
+
+def ensure_cwd_path(raw: str) -> str:
+    path = normalize_path(raw)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise CcdError(f"工作目录不是目录: {path}")
+    return str(path)
+
+
+def choose_from_list(items: list[Any], prompt: str, label_fn) -> Any | None:
+    if not items:
+        return None
+    for i, item in enumerate(items, start=1):
+        print(f"[{i}] {label_fn(item)}")
+    choice = globals()["prompt"](f"{prompt} [编号/名称，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(items):
+            return items[idx - 1]
+    for item in items:
+        if label_fn(item) == choice or getattr(item, "id", None) == choice:
+            return item
+    print(red("无效选择。"))
+    return None
+
+
+def choose_ccd_session(prompt: str = "选择 ccd 会话") -> dict[str, Any] | None:
+    registry = load_registry()
+    sessions = print_sessions(registry)
+    if not sessions:
+        return None
+    choice = globals()["prompt"](f"{prompt} [编号/名称，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(sessions):
+            return sessions[idx - 1]
+    for session in sessions:
+        if session.get("name") == choice:
+            return session
+    print(red("未找到会话。"))
+    return None
+
+
+def ask_yes_no(prompt: str, *, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    answer = globals()["prompt"](f"{prompt} {suffix} ").lower()
+    if not answer:
+        return default
+    return answer in {"y", "yes"}
+
+
+def ensure_last_cwd(session: dict[str, Any]) -> bool:
+    cwd = session.get("last_cwd")
+    if cwd and Path(cwd).is_dir():
+        return True
+    print_header("工作目录需要确认", "恢复 Claude Code 前需要一个有效目录。")
+    print(f"  上次目录: {yellow(cwd or '-')}")
+    default = str(HOME)
+    raw = prompt(f"请输入新的目录，空使用 {default}: ") or default
+    path = normalize_path(raw)
+    if not path.exists():
+        if not ask_yes_no(f"目录不存在：{path}，是否创建？", default=False):
+            return False
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(red(f"创建目录失败: {exc}"))
+            return False
+    if not path.is_dir():
+        print(red("路径存在但不是目录。"))
+        return False
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, session["id"])
+        if not current:
+            print(red("注册表中找不到该会话。"))
+            return False
+        current["last_cwd"] = str(path)
+        current["updated_at"] = now_utc()
+        save_registry(registry)
+    session["last_cwd"] = str(path)
+    return True
+
+
+def choose_session_directory() -> str | None:
+    config = load_config()
+    roots = config.get("roots", [])
+    if not roots:
+        print_empty("没有常用目录，请先添加 root。")
+        return None
+    print_header("选择工作目录", "先选择常用目录；可再输入相对文件夹名，空表示直接使用该目录。")
+    for i, root in enumerate(roots, start=1):
+        print(f"  {cyan(str(i).rjust(2))}  {bold(root['name'])}")
+        print(f"      {dim(root['path'])}")
+    print(rule())
+    raw = prompt("选择常用目录编号: ")
+    if not raw.isdigit() or not (1 <= int(raw) <= len(roots)):
+        print(red("无效选择。"))
+        return None
+    root_path = normalize_path(roots[int(raw) - 1]["path"])
+    if not root_path.exists():
+        if not ask_yes_no(f"常用目录不存在：{root_path}，是否创建？", default=False):
+            return None
+        try:
+            root_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(red(f"创建常用目录失败: {exc}"))
+            return None
+    if not root_path.is_dir():
+        print(red(f"常用目录不是目录：{root_path}"))
+        return None
+    child_raw = prompt("新建文件夹名（可空；支持 a/b/c）: ")
+    try:
+        child = validate_child_path(child_raw)
+    except CcdError as exc:
+        print(red(f"错误: {exc}"))
+        return None
+    final_path = root_path if child is None else root_path / child
+    if final_path.exists() and not final_path.is_dir():
+        print(red(f"路径存在但不是目录：{final_path}"))
+        return None
+    if not final_path.exists():
+        try:
+            final_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(red(f"创建目录失败: {exc}"))
+            return None
+    return str(final_path.resolve(strict=False))
+
+
+def current_ccd_path() -> str:
+    arg0 = Path(sys.argv[0])
+    if arg0.is_absolute() and arg0.exists():
+        return str(arg0.resolve())
+    found = shutil.which("ccd")
+    if found:
+        return str(Path(found).resolve())
+    return str(arg0.resolve(strict=False))
+
+
+def is_hook_installed() -> bool:
+    if not CLAUDE_SETTINGS_PATH.exists():
+        return False
+    try:
+        settings = load_json(CLAUDE_SETTINGS_PATH, {})
+    except Exception:
+        return False
+    for group in settings.get("hooks", {}).get("SessionStart", []):
+        for hook in group.get("hooks", []):
+            command = hook.get("command", "")
+            if "__hook-session-start" in command:
+                return True
+    return False
+
+
+def install_settings_hook() -> None:
+    CLAUDE_HOME.mkdir(parents=True, exist_ok=True)
+    settings = load_json(CLAUDE_SETTINGS_PATH, {})
+    if not isinstance(settings, dict):
+        raise CcdError(f"{CLAUDE_SETTINGS_PATH} 格式不兼容：settings 必须是对象。")
+    if "hooks" in settings and not isinstance(settings.get("hooks"), dict):
+        raise CcdError(f"{CLAUDE_SETTINGS_PATH} 格式不兼容：hooks 必须是对象。")
+    events = settings.setdefault("hooks", {})
+    groups = events.setdefault("SessionStart", [])
+    if not isinstance(groups, list):
+        raise CcdError(f"{CLAUDE_SETTINGS_PATH} 格式不兼容：SessionStart 必须是数组。")
+
+    cleaned = []
+    for group in groups:
+        group_hooks = group.get("hooks", []) if isinstance(group, dict) else []
+        kept_hooks = [h for h in group_hooks if "__hook-session-start" not in h.get("command", "")]
+        if kept_hooks:
+            next_group = dict(group)
+            next_group["hooks"] = kept_hooks
+            cleaned.append(next_group)
+    command = f"{shlex.quote(current_ccd_path())} __hook-session-start"
+    cleaned.append(
+        {
+            "matcher": "^(startup|resume)$",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": 10,
+                    "statusMessage": CCD_HOOK_STATUS,
+                }
+            ],
+        }
+    )
+    events["SessionStart"] = cleaned
+    write_json_atomic(CLAUDE_SETTINGS_PATH, settings, backup=CLAUDE_SETTINGS_PATH.exists(), timestamped=True)
+    log_event(f"installed session-start hook: {command}")
+
+
+def install_hook_interactive(auto: bool = False) -> bool:
+    if auto:
+        print("ccd 需要安装 Claude Code SessionStart hook 到 ~/.claude/settings.json。")
+    if not ask_yes_no("继续安装/校验 hook？", default=True):
+        print("已取消 hook 安装。")
+        return False
+    install_settings_hook()
+    print("hook 已安装。")
+    return True
+
+
+def cmd_init(auto: bool = False) -> int:
+    ensure_dirs()
+    if not CONFIG_PATH.exists():
+        save_config(default_config())
+        print(f"已创建配置: {CONFIG_PATH}")
+    if not REGISTRY_PATH.exists():
+        save_registry(default_registry())
+        print(f"已创建注册表: {REGISTRY_PATH}")
+    if not is_hook_installed():
+        if not install_hook_interactive(auto=auto):
+            return 1
+    else:
+        print("hook 已安装。")
+    log_event("init completed")
+    return 0
+
+
+def ensure_initialized() -> bool:
+    if CONFIG_PATH.exists() and REGISTRY_PATH.exists() and is_hook_installed():
+        return True
+    print("ccd 尚未初始化或 hook 缺失，先运行 init。")
+    return cmd_init(auto=True) == 0
+
+
+def create_record(name: str, cwd: str, claude_session_id: str | None = None, transcript_path: str | None = None) -> dict[str, Any]:
+    with registry_lock():
+        registry = load_registry()
+        if find_session_by_name(registry, name):
+            raise CcdError(f"会话已存在: {name}")
+        sid = unique_session_id(registry)
+        created = now_utc()
+        session = {
+            "id": sid,
+            "name": name,
+            "tmux_session": f"ccd_{sid}",
+            "claude_session_id": claude_session_id,
+            "last_cwd": cwd,
+            "created_at": created,
+            "updated_at": created,
+            "last_used_at": created,
+            "transcript_path": transcript_path,
+        }
+        registry["sessions"].append(session)
+        save_registry(registry)
+        log_event(f"created ccd session id={sid} name={name!r}")
+        return session
+
+
+def create_tmux_if_needed(session: dict[str, Any]) -> bool:
+    require_tool("tmux")
+    require_tool("claude")
+    tmux_name = session["tmux_session"]
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, session["id"])
+        if not current:
+            raise CcdError("注册表中找不到该会话。")
+        if tmux_exists(tmux_name):
+            configure_tmux_session(tmux_name)
+            return True
+        window_name = short_text(current["name"], 30) or "ccd"
+        command = f"{shlex.quote(current_ccd_path())} __runner {shlex.quote(current['id'])}"
+        result = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", tmux_name, "-n", window_name, command],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            print(f"创建 tmux 失败: {result.stderr.strip() or result.stdout.strip()}")
+            return False
+        configure_tmux_session(tmux_name)
+        log_event(f"created tmux session {tmux_name} for ccd id={current['id']}")
+        return True
+
+
+def attach_tmux(session: dict[str, Any]) -> int:
+    tmux_name = session["tmux_session"]
+    configure_tmux_session(tmux_name)
+    if os.environ.get("TMUX"):
+        result = subprocess.run(["tmux", "switch-client", "-t", tmux_name])
+    else:
+        result = subprocess.run(["tmux", "attach-session", "-t", tmux_name])
+    if result.returncode != 0:
+        print(f"进入 tmux 失败，session 已保留: {tmux_name}")
+    return result.returncode
+
+
+def touch_last_used(session_id: str) -> None:
+    with registry_lock():
+        registry = load_registry()
+        session = find_session_by_id(registry, session_id)
+        if not session:
+            return
+        ts = now_utc()
+        session["last_used_at"] = ts
+        session["updated_at"] = ts
+        save_registry(registry)
+
+
+def enter_session(session: dict[str, Any], *, unbound_mode: str = "prompt") -> int:
+    if tmux_exists(session["tmux_session"]):
+        touch_last_used(session["id"])
+        return attach_tmux(session)
+    if not session.get("claude_session_id"):
+        if unbound_mode == "new":
+            pass
+        else:
+            print_menu(
+                f"未绑定: {session['name']}",
+                [
+                    ("1", "新建 Claude Code 会话并绑定", "启动新的 Claude Code TUI，hook 会回写 session id"),
+                    ("2", "绑定已有 Claude Code 会话", "从 Claude Code 原始历史里选择一个会话"),
+                    ("3", "取消", "返回上一级"),
+                ],
+                "该 ccd 会话还没有绑定 Claude Code 原始会话。",
+            )
+            choice = prompt("请选择: ")
+            if choice == "2":
+                if map_bind(target_session_id=session["id"]) == 0:
+                    with registry_lock():
+                        registry = load_registry()
+                        refreshed = find_session_by_id(registry, session["id"])
+                        if refreshed:
+                            session = refreshed
+                    if not session.get("claude_session_id"):
+                        return 1
+                else:
+                    return 1
+            elif choice != "1":
+                print(dim("已取消。"))
+                return 1
+    if not ensure_last_cwd(session):
+        return 1
+    touch_last_used(session["id"])
+    if not create_tmux_if_needed(session):
+        return 1
+    return attach_tmux(session)
+
+
+def cmd_list(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    if args:
+        print_error(f"未知参数: {' '.join(args)}", json_mode=json_mode)
+        return 1
+    registry = load_registry()
+    if json_mode:
+        emit_json(
+            {
+                "ok": True,
+                "version": VERSION,
+                "sessions": [session_json(session) for session in sorted_sessions(registry)],
+            }
+        )
+        return 0
+    print_sessions(registry)
+    return 0
+
+
+def print_uuid_detail(session: dict[str, Any]) -> int:
+    print_header("Claude Code Session ID", "这是 ccd 记录的真实 Claude Code session id。")
+    print(f"  ccd_name:     {bold(session.get('name', ''))}")
+    print(f"  ccd 内部 id:  {dim(session.get('id', ''))}")
+    print(f"  tmux:         {dim(session.get('tmux_session', ''))}  {status_text(tmux_status(session))}")
+    claude_id = session.get("claude_session_id")
+    if claude_id:
+        print(f"  session id:   {green(claude_id)}")
+        transcript = session.get("transcript_path")
+        if transcript:
+            print(f"  transcript:   {dim(transcript)}")
+        return 0
+    print(f"  session id:   {yellow('未绑定')}")
+    print()
+    print(dim("  进入一次该会话让 hook 回写 session id，或使用 ccd map 手动绑定/导入。"))
+    return 1
+
+
+def cmd_uuid(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    registry = load_registry()
+    if args and args[0] == "--all":
+        args = args[1:]
+        if args:
+            print_error(f"未知参数: {' '.join(args)}", json_mode=json_mode)
+            return 1
+        sessions = sorted_sessions(registry)
+        if json_mode:
+            emit_json(
+                {
+                    "ok": True,
+                    "sessions": [
+                        {
+                            "id": session.get("id"),
+                            "name": session.get("name"),
+                            "claude_session_id": session.get("claude_session_id"),
+                            "bound": bool(session.get("claude_session_id")),
+                        }
+                        for session in sessions
+                    ],
+                }
+            )
+            return 0
+        if not sessions:
+            print_empty("当前没有 ccd 会话。")
+            return 0
+        print_header("Claude Code Session ID", "列出所有 ccd 会话绑定的 Claude Code session id。")
+        for session in sessions:
+            claude_id = session.get("claude_session_id") or "未绑定"
+            value = green(claude_id) if session.get("claude_session_id") else yellow(claude_id)
+            print(f"  {bold(session.get('name', ''))}")
+            print(f"      {value}")
+        return 0
+    session = resolve_session_arg(args, "查看哪个会话的 session id", noninteractive=json_mode, json_mode=json_mode)
+    if not session:
+        return 1
+    if json_mode:
+        emit_json(
+            {
+                "ok": True,
+                "id": session.get("id"),
+                "name": session.get("name"),
+                "claude_session_id": session.get("claude_session_id"),
+                "bound": bool(session.get("claude_session_id")),
+                "transcript_path": session.get("transcript_path"),
+            }
+        )
+        return 0
+    return print_uuid_detail(session)
+
+
+def cmd_new(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    no_enter = take_flag(args, "--no-enter") or json_mode
+    try:
+        cwd_arg = take_option(args, "--cwd")
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    try:
+        require_tool("tmux")
+        require_tool("claude")
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    if args:
+        name = " ".join(args).strip()
+    elif no_enter:
+        print_error("缺少 ccd_name。", json_mode=json_mode)
+        return 1
+    else:
+        name = prompt("ccd_name: ")
+    try:
+        name = validate_name(name)
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    registry = load_registry()
+    existing = find_session_by_name(registry, name)
+    if existing:
+        if json_mode:
+            emit_json({"ok": True, "existing": True, "session": session_json(existing)})
+            return 0
+        print(cyan(f"会话“{name}”已存在，直接进入。"))
+        if no_enter:
+            return 0
+        return enter_session(existing)
+    if cwd_arg is not None:
+        try:
+            cwd = ensure_cwd_path(cwd_arg)
+        except (CcdError, OSError) as exc:
+            print_error(f"错误: {exc}", json_mode=json_mode)
+            return 1
+    else:
+        if no_enter:
+            print_error("非交互新建会话需要 --cwd。", json_mode=json_mode)
+            return 1
+        cwd = choose_session_directory()
+        if not cwd:
+            return 1
+    try:
+        session = create_record(name, cwd)
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    if json_mode:
+        emit_json({"ok": True, "existing": False, "session": session_json(session)})
+    if no_enter:
+        return 0
+    return enter_session(session, unbound_mode="new")
+
+
+def resolve_session_arg(args: list[str], prompt: str, *, noninteractive: bool = False, json_mode: bool = False) -> dict[str, Any] | None:
+    if args:
+        name = " ".join(args).strip()
+        registry = load_registry()
+        session = find_session_by_name(registry, name)
+        if not session:
+            print_error(f"未找到会话: {name}", json_mode=json_mode)
+            return None
+        return session
+    if noninteractive:
+        print_error("缺少 ccd_name。", json_mode=json_mode)
+        return None
+    return choose_ccd_session(prompt)
+
+
+def cmd_enter(args: list[str]) -> int:
+    args = list(args)
+    print_command = take_flag(args, "--print-command")
+    new_if_unbound = take_flag(args, "--new-if-unbound")
+    session = resolve_session_arg(args, "进入哪个会话", noninteractive=print_command)
+    if not session:
+        return 1
+    if print_command:
+        flags = " --new-if-unbound" if new_if_unbound else ""
+        print(f"{shlex.quote(current_ccd_path())} enter{flags} {shlex.quote(session['name'])}")
+        return 0
+    return enter_session(session, unbound_mode="new" if new_if_unbound else "prompt")
+
+
+def cmd_delete(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    yes = take_flag(args, "--yes")
+    noninteractive = json_mode or yes
+    session = resolve_session_arg(args, "删除哪个会话", noninteractive=noninteractive, json_mode=json_mode)
+    if not session:
+        return 1
+    live = tmux_exists(session["tmux_session"])
+    if not yes:
+        print_header("删除确认", "该操作会删除 ccd 映射，不会删除 Claude Code 原始历史。")
+        print(f"  会话: {bold(session['name'])}")
+        print(f"  tmux: {status_text('live') if live else dim('exited')}")
+        print()
+        print("  将执行:")
+        print("  - 从 ccd 列表移除")
+        if live:
+            print("  - tmux 正在运行，会被直接关闭并中断 Claude Code")
+        else:
+            print("  - tmux 未运行")
+        print("  - 不会删除 Claude Code 原始会话历史")
+        confirm = prompt("输入完整会话名确认: ")
+        if confirm != session["name"]:
+            print(yellow("确认不匹配，已取消。"))
+            return 1
+    else:
+        log_event(f"delete confirmed by --yes ccd id={session['id']} name={session['name']!r}")
+    if live:
+        subprocess.run(["tmux", "kill-session", "-t", session["tmux_session"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_event(f"killed tmux session {session['tmux_session']} during delete")
+    with registry_lock():
+        registry = load_registry()
+        registry["sessions"] = [s for s in registry.get("sessions", []) if s.get("id") != session["id"]]
+        save_registry(registry, timestamped_backup=True)
+    log_event(f"deleted ccd session id={session['id']} name={session['name']!r}")
+    if json_mode:
+        emit_json({"ok": True, "killed_tmux": live, "session": session_json(session, include_status=False)})
+        return 0
+    print(green("已删除 ccd 映射。"))
+    return 0
+
+
+def cmd_rename(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    if args:
+        if len(args) < 2:
+            print_error("用法: ccd rename [--json] OLD NEW", json_mode=json_mode)
+            return 1
+        old_name = args[0]
+        new_name = " ".join(args[1:]).strip() if len(args) > 1 else prompt("新的 ccd_name: ")
+        registry = load_registry()
+        session = find_session_by_name(registry, old_name)
+        if not session:
+            print_error(f"未找到会话: {old_name}", json_mode=json_mode)
+            return 1
+    else:
+        if json_mode:
+            print_error("缺少 OLD 和 NEW。", json_mode=True)
+            return 1
+        session = choose_ccd_session("重命名哪个会话")
+        if not session:
+            return 1
+        new_name = prompt("新的 ccd_name: ")
+    try:
+        new_name = validate_name(new_name)
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    renamed_session: dict[str, Any] | None = None
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, session["id"])
+        if not current:
+            print_error("注册表中找不到该会话。", json_mode=json_mode)
+            return 1
+        dup = find_session_by_name(registry, new_name)
+        if dup and dup.get("id") != current["id"]:
+            print_error(f"会话名已存在: {new_name}", json_mode=json_mode)
+            return 1
+        old = current["name"]
+        current["name"] = new_name
+        current["updated_at"] = now_utc()
+        renamed_session = dict(current)
+        save_registry(registry, timestamped_backup=True)
+    if tmux_exists(session["tmux_session"]):
+        subprocess.run(
+            ["tmux", "rename-window", "-t", f"{session['tmux_session']}:0", short_text(new_name, 30)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    log_event(f"renamed ccd session id={session['id']} {old!r}->{new_name!r}")
+    if json_mode:
+        emit_json({"ok": True, "old_name": old, "session": session_json(renamed_session or session)})
+        return 0
+    print(green(f"已重命名: {old} -> {new_name}"))
+    return 0
+
+
+def cmd_roots(args: list[str]) -> int:
+    sub = args[0] if args else ""
+    rest = args[1:] if args else []
+    if sub in {"list", "ls"}:
+        return roots_list()
+    if sub == "add":
+        return roots_add(rest)
+    if sub in {"delete", "del", "rm"}:
+        return roots_delete(rest)
+    if sub in {"rename", "ren", "mv"}:
+        return roots_rename(rest)
+    if sub in {"edit", "path"}:
+        return roots_edit(rest)
+    return roots_menu()
+
+
+def roots_list() -> int:
+    config = load_config()
+    roots = config.get("roots", [])
+    if not roots:
+        print_empty("没有常用目录。")
+        return 0
+    print_header("常用目录", "新建会话时会从这些 root 中选择工作目录。")
+    for i, root in enumerate(roots, start=1):
+        path = root["path"]
+        path_status = "" if Path(path).expanduser().is_dir() else f" {yellow('missing')}"
+        print(f"  {cyan(str(i).rjust(2))}  {bold(root['name'])}{path_status}")
+        print(f"      {dim(path)}")
+    return 0
+
+
+def root_name_exists(config: dict[str, Any], name: str, ignore_id: str | None = None) -> bool:
+    return any(r.get("name") == name and r.get("id") != ignore_id for r in config.get("roots", []))
+
+
+def root_path_exists(config: dict[str, Any], path: str, ignore_id: str | None = None) -> bool:
+    return any(str(normalize_path(r.get("path", ""))) == path and r.get("id") != ignore_id for r in config.get("roots", []))
+
+
+def roots_add(args: list[str]) -> int:
+    name = args[0] if len(args) >= 1 else prompt("root 名: ")
+    path_raw = args[1] if len(args) >= 2 else prompt("目录路径: ")
+    try:
+        name = validate_root_name(name)
+    except CcdError as exc:
+        print(red(f"错误: {exc}"))
+        return 1
+    path = normalize_path(path_raw)
+    if not path.exists():
+        if not ask_yes_no(f"目录不存在：{path}，是否创建？", default=False):
+            return 1
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(red(f"创建失败: {exc}"))
+            return 1
+    if not path.is_dir():
+        print(red("路径存在但不是目录。"))
+        return 1
+    config = load_config()
+    if root_name_exists(config, name):
+        print(red("root 名已存在。"))
+        return 1
+    if root_path_exists(config, str(path)):
+        print(red("root 路径已存在。"))
+        return 1
+    rid = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or secrets.token_hex(3)
+    existing_ids = {r.get("id") for r in config.get("roots", [])}
+    base = rid
+    n = 2
+    while rid in existing_ids:
+        rid = f"{base}-{n}"
+        n += 1
+    config.setdefault("roots", []).append({"id": rid, "name": name, "path": str(path)})
+    save_config(config)
+    print(green(f"已添加 root: {name} {path}"))
+    return 0
+
+
+def choose_root(prompt: str) -> dict[str, Any] | None:
+    config = load_config()
+    roots = config.get("roots", [])
+    if not roots:
+        print_empty("没有常用目录。")
+        return None
+    print_header("常用目录")
+    for i, root in enumerate(roots, start=1):
+        print(f"  {cyan(str(i).rjust(2))}  {bold(root['name'])}")
+        print(f"      {dim(root['path'])}")
+    print(rule())
+    choice = globals()["prompt"](f"{prompt} [编号/名称，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(roots):
+            return roots[idx - 1]
+    for root in roots:
+        if root.get("name") == choice:
+            return root
+    print(red("未找到 root。"))
+    return None
+
+
+def roots_delete(args: list[str]) -> int:
+    config = load_config()
+    if len(config.get("roots", [])) <= 1:
+        print(yellow("不能删除最后一个常用目录。"))
+        return 1
+    if args:
+        target = next((r for r in config.get("roots", []) if r.get("name") == args[0]), None)
+    else:
+        target = choose_root("删除哪个 root")
+    if not target:
+        return 1
+    root_path = normalize_path(target["path"])
+    registry = load_registry()
+    affected = []
+    for session in registry.get("sessions", []):
+        last_cwd = session.get("last_cwd")
+        if not last_cwd:
+            continue
+        try:
+            Path(last_cwd).resolve(strict=False).relative_to(root_path)
+            affected.append(session)
+        except ValueError:
+            pass
+    if affected:
+        print(yellow(f"有 {len(affected)} 个会话的 last_cwd 位于该目录下；删除 root 不会删除这些会话或目录。"))
+    if not ask_yes_no(f"确认删除 root：{target['name']}？", default=False):
+        return 1
+    config["roots"] = [r for r in config.get("roots", []) if r.get("id") != target.get("id")]
+    save_config(config)
+    print(green("已删除 root。"))
+    return 0
+
+
+def roots_rename(args: list[str]) -> int:
+    config = load_config()
+    if args:
+        target = next((r for r in config.get("roots", []) if r.get("name") == args[0]), None)
+        new_name = " ".join(args[1:]).strip() if len(args) > 1 else prompt("新的 root 名: ")
+    else:
+        target = choose_root("重命名哪个 root")
+        if not target:
+            return 1
+        new_name = prompt("新的 root 名: ")
+    if not target:
+        print(red("未找到 root。"))
+        return 1
+    try:
+        new_name = validate_root_name(new_name)
+    except CcdError as exc:
+        print(red(f"错误: {exc}"))
+        return 1
+    if root_name_exists(config, new_name, ignore_id=target["id"]):
+        print(red("root 名已存在。"))
+        return 1
+    old = target["name"]
+    target["name"] = new_name
+    save_config(config)
+    print(green(f"已重命名 root: {old} -> {new_name}"))
+    return 0
+
+
+def roots_edit(args: list[str]) -> int:
+    config = load_config()
+    if args:
+        target = next((r for r in config.get("roots", []) if r.get("name") == args[0]), None)
+        path_raw = args[1] if len(args) > 1 else prompt("新的目录路径: ")
+    else:
+        target = choose_root("修改哪个 root 路径")
+        if not target:
+            return 1
+        path_raw = prompt("新的目录路径: ")
+    if not target:
+        print(red("未找到 root。"))
+        return 1
+    path = normalize_path(path_raw)
+    if not path.exists():
+        if not ask_yes_no(f"目录不存在：{path}，是否创建？", default=False):
+            return 1
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(red(f"创建失败: {exc}"))
+            return 1
+    if not path.is_dir():
+        print(red("路径存在但不是目录。"))
+        return 1
+    if root_path_exists(config, str(path), ignore_id=target["id"]):
+        print(red("root 路径已存在。"))
+        return 1
+    target["path"] = str(path)
+    save_config(config)
+    print(green("已修改 root 路径。"))
+    return 0
+
+
+def roots_menu() -> int:
+    while True:
+        print_menu(
+            "管理常用目录",
+            [
+                ("1", "列出常用目录", "查看新建会话时可选的 root"),
+                ("2", "添加目录", "添加一个新的 root"),
+                ("3", "删除目录", "不会删除已有会话或真实目录"),
+                ("4", "重命名目录", "只改显示名"),
+                ("5", "修改目录路径", "更新 root 指向的位置"),
+                ("0", "返回", "回到主菜单"),
+            ],
+        )
+        choice = prompt("请选择: ")
+        if choice == "1":
+            roots_list()
+        elif choice == "2":
+            roots_add([])
+        elif choice == "3":
+            roots_delete([])
+        elif choice == "4":
+            roots_rename([])
+        elif choice == "5":
+            roots_edit([])
+        elif choice in {"0", "q", "Q"}:
+            return 0
+        else:
+            print(red("无效选项。"))
+
+
+def load_claude_sessions() -> list[RawClaudeSession]:
+    sessions: dict[str, RawClaudeSession] = {}
+    if CLAUDE_HISTORY_PATH.exists():
+        with CLAUDE_HISTORY_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = item.get("sessionId")
+                if not sid:
+                    continue
+                title = user_visible_conversation_text(item.get("display")) or "(untitled)"
+                sessions[sid] = RawClaudeSession(id=sid, title=title, updated_at=timestamp_to_iso(item.get("timestamp")), cwd=item.get("project"))
+
+    if CLAUDE_PROJECTS_DIR.exists():
+        for path in CLAUDE_PROJECTS_DIR.glob("**/*.jsonl"):
+            sid = None
+            title = None
+            cwd = None
+            timestamp = None
+            try:
+                stat_time = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            except OSError:
+                stat_time = None
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for idx, line in enumerate(f):
+                        if idx > 250 and sid:
+                            break
+                        try:
+                            item = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        sid = item.get("sessionId") or sid
+                        cwd = item.get("cwd") or cwd
+                        timestamp = item.get("timestamp") or timestamp
+                        if not title and item.get("type") == "user" and not item.get("isMeta"):
+                            text = user_visible_conversation_text(extract_claude_message_text(item.get("message")))
+                            title = text[:80] if text else title
+            except OSError:
+                continue
+            if not sid:
+                match = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", path.name)
+                sid = match.group(1) if match else None
+            if not sid:
+                continue
+            existing = sessions.get(sid)
+            if existing:
+                existing.cwd = existing.cwd or cwd
+                existing.transcript_path = existing.transcript_path or str(path)
+                existing.updated_at = timestamp_to_iso(timestamp) or existing.updated_at or stat_time
+                if existing.title == "(untitled)" and title:
+                    existing.title = title
+            else:
+                sessions[sid] = RawClaudeSession(
+                    id=sid,
+                    title=title or "(untitled)",
+                    updated_at=timestamp_to_iso(timestamp) or stat_time,
+                    cwd=cwd,
+                    transcript_path=str(path),
+                )
+    return sorted(sessions.values(), key=lambda s: sort_key_time(s.updated_at), reverse=True)
+
+
+def choose_raw_claude_session(prompt: str = "选择 Claude Code 原始会话") -> RawClaudeSession | None:
+    raws = load_claude_sessions()
+    if not raws:
+        print_empty("没有找到 Claude Code 原始会话。")
+        return None
+    registry = load_registry()
+    bound = {s.get("claude_session_id"): s.get("name") for s in registry.get("sessions", []) if s.get("claude_session_id")}
+    print_header("Claude Code 原始会话", "按最近更新时间排序；bound 表示已被 ccd 管理。")
+    width = ui_width()
+    index_width = max(2, len(str(len(raws))))
+    row_indent = " " * (4 + index_width)
+    title_width = max(12, width - (4 + index_width))
+    narrow = width < 78
+    for i, raw in enumerate(raws, start=1):
+        bound_name = bound.get(raw.id)
+        title = short_display_text(raw.title, title_width)
+        raw_id = compact_uuid(raw.id)
+        time_text = display_time(raw.updated_at)
+        print(f"  {cyan(str(i).rjust(index_width))}  {bold(title)}")
+        meta = f"id: {raw_id}  {time_text}"
+        if not narrow and bound_name:
+            bound_text = short_display_text(bound_name, max(8, width - (4 + index_width) - display_len(meta) - 10))
+            if display_len(meta) + 10 + display_len(bound_text) <= width - (4 + index_width):
+                print(f"{row_indent}{dim(meta)}  {status_text('bound')}: {dim(bound_text)}")
+            else:
+                print(f"{row_indent}{dim(meta)}")
+                print(f"{row_indent}{status_text('bound')}: {dim(bound_text)}")
+            continue
+        print(f"{row_indent}{dim(meta)}")
+        if bound_name:
+            bound_text = short_display_text(bound_name, max(8, width - (4 + index_width) - display_len("bound: ")))
+            print(f"{row_indent}{status_text('bound')}: {dim(bound_text)}")
+    print(rule())
+    choice = globals()["prompt"](f"{prompt} [编号/session id，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(raws):
+            return raws[idx - 1]
+    for raw in raws:
+        if raw.id == choice or raw.id.startswith(choice):
+            return raw
+    print(red("未找到 Claude Code 会话。"))
+    return None
+
+
+def raw_conversation_preview(raw: RawClaudeSession, *, limit: int = 2) -> list[str]:
+    user_snippets: list[str] = []
+    assistant_snippets: list[str] = []
+    seen: set[str] = set()
+    if raw.transcript_path and Path(raw.transcript_path).exists():
+        try:
+            with Path(raw.transcript_path).open("r", encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    if idx > 800 and (user_snippets or assistant_snippets):
+                        break
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = ""
+                    role = ""
+                    if item.get("type") in {"user", "assistant"} and not item.get("isMeta"):
+                        message = item.get("message")
+                        if isinstance(message, dict):
+                            role = message.get("role", item.get("type"))
+                            text = user_visible_conversation_text(extract_claude_message_text(message))
+                    if text and text not in seen:
+                        if role == "user":
+                            user_snippets.append(text)
+                        elif role == "assistant":
+                            assistant_snippets.append(text)
+                        seen.add(text)
+                    if user_snippets and assistant_snippets:
+                        break
+        except OSError:
+            pass
+    if user_snippets:
+        snippets = [user_snippets[0]]
+        if assistant_snippets:
+            snippets.append(assistant_snippets[0])
+        elif len(user_snippets) > 1:
+            snippets.append(user_snippets[1])
+        return snippets[:limit]
+    if assistant_snippets:
+        return assistant_snippets[:limit]
+    fallback = user_visible_conversation_text(raw.title)
+    return [fallback] if fallback else ["(无可预览内容)"]
+
+
+def choose_raw_claude_session_for_import(prompt: str = "导入哪个 Claude Code 对话") -> RawClaudeSession | None:
+    raws = load_claude_sessions()
+    if not raws:
+        print_empty("没有找到 Claude Code 原始会话。")
+        return None
+    registry = load_registry()
+    bound_ids = {s.get("claude_session_id") for s in registry.get("sessions", []) if s.get("claude_session_id")}
+    importable = [raw for raw in raws if raw.id not in bound_ids][:RAW_IMPORT_PREVIEW_LIMIT]
+    if not importable:
+        print_empty("没有可导入的未绑定 Claude Code 原始会话。")
+        return None
+    print_header("导入 Claude Code 对话", f"显示最近 {RAW_IMPORT_PREVIEW_LIMIT} 次未管理的 Claude Code 对话；只显示对话内容。")
+    width = ui_width()
+    index_width = max(2, len(str(len(importable))))
+    row_indent = " " * (4 + index_width)
+    content_width = max(12, width - (4 + index_width))
+    for i, raw in enumerate(importable, start=1):
+        snippets = raw_conversation_preview(raw, limit=2)
+        print(f"  {cyan(str(i).rjust(index_width))}  {bold(short_display_text(snippets[0], content_width))}")
+        for snippet in snippets[1:]:
+            print(f"{row_indent}{dim(short_display_text(snippet, content_width))}")
+    print(rule())
+    choice = globals()["prompt"](f"{prompt} [编号，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(importable):
+            return importable[idx - 1]
+    for raw in importable:
+        if raw.id == choice or raw.id.startswith(choice):
+            return raw
+    print(red("未找到 Claude Code 会话。"))
+    return None
+
+
+def map_bind(target_session_id: str | None = None, *, force_transfer: bool = False) -> int:
+    if target_session_id:
+        registry = load_registry()
+        target = find_session_by_id(registry, target_session_id)
+    else:
+        target = choose_ccd_session("绑定到哪个 ccd 会话")
+    if not target:
+        return 1
+    if tmux_exists(target["tmux_session"]):
+        print(yellow("该 ccd 会话正在运行，MVP 不允许修改绑定。请先退出 Claude Code。"))
+        return 1
+    raw = choose_raw_claude_session()
+    if not raw:
+        return 1
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, target["id"])
+        if not current:
+            print(red("注册表中找不到目标会话。"))
+            return 1
+        holder = find_session_by_claude_id(registry, raw.id)
+        if holder and holder.get("id") != current.get("id"):
+            if tmux_exists(holder["tmux_session"]):
+                print(yellow(f"该 Claude Code 会话已绑定到 live 会话：{holder['name']}，不能转移。"))
+                return 1
+            if not force_transfer:
+                print(yellow(f"该 Claude Code 会话已绑定到：{holder['name']}"))
+                if not ask_yes_no(f"是否转移绑定到：{current['name']}？", default=False):
+                    return 1
+            holder["claude_session_id"] = None
+            holder["transcript_path"] = None
+            holder["updated_at"] = now_utc()
+        if current.get("claude_session_id") and current.get("claude_session_id") != raw.id:
+            if not ask_yes_no("目标会话已有绑定，是否替换？", default=False):
+                return 1
+        current["claude_session_id"] = raw.id
+        if raw.cwd:
+            current["last_cwd"] = raw.cwd
+        current["transcript_path"] = raw.transcript_path
+        current["updated_at"] = now_utc()
+        save_registry(registry, timestamped_backup=True)
+    print(green("绑定完成。"))
+    log_event(f"bound ccd id={target['id']} to claude id={raw.id}")
+    return 0
+
+
+def map_import() -> int:
+    raw = choose_raw_claude_session_for_import()
+    if not raw:
+        return 1
+    registry = load_registry()
+    name = prompt("新的 ccd_name: ")
+    try:
+        name = validate_name(name)
+    except CcdError as exc:
+        print(red(f"错误: {exc}"))
+        return 1
+    if find_session_by_name(registry, name):
+        print(red("ccd_name 已存在。"))
+        return 1
+    cwd = raw.cwd if raw.cwd and Path(raw.cwd).is_dir() else None
+    if not cwd:
+        print(yellow("无法从 Claude Code 原始会话读取有效 cwd，请选择目录。"))
+        cwd = choose_session_directory()
+        if not cwd:
+            return 1
+    try:
+        create_record(name, cwd, claude_session_id=raw.id, transcript_path=raw.transcript_path)
+    except CcdError as exc:
+        print(red(f"错误: {exc}"))
+        return 1
+    print(green("导入完成。"))
+    return 0
+
+
+def map_unbind() -> int:
+    target = choose_ccd_session("解除哪个 ccd 会话的绑定")
+    if not target:
+        return 1
+    if tmux_exists(target["tmux_session"]):
+        print(yellow("该 ccd 会话正在运行，MVP 不允许解除绑定。请先退出 Claude Code。"))
+        return 1
+    if not target.get("claude_session_id"):
+        print(dim("该会话没有绑定。"))
+        return 0
+    if not ask_yes_no(f"确认解除绑定：{target['name']}？", default=False):
+        return 1
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, target["id"])
+        if not current:
+            return 1
+        current["claude_session_id"] = None
+        current["transcript_path"] = None
+        current["updated_at"] = now_utc()
+        save_registry(registry, timestamped_backup=True)
+    print(green("已解除绑定。"))
+    return 0
+
+
+def cmd_map(args: list[str]) -> int:
+    sub = args[0] if args else ""
+    if sub == "bind":
+        return map_bind()
+    if sub == "import":
+        return map_import()
+    if sub in {"unbind", "clear"}:
+        return map_unbind()
+    if sub == "transfer":
+        return map_bind(force_transfer=True)
+    return map_menu()
+
+
+def map_menu() -> int:
+    while True:
+        print_menu(
+            "手动映射/导入",
+            [
+                ("1", "绑定已有 Claude Code 会话", "把原始 Claude Code session id 绑定到已有 ccd 会话"),
+                ("2", "导入为新的 ccd 会话", "从 Claude Code 历史创建一个新的 ccd_name"),
+                ("3", "解除绑定", "保留 ccd 会话，但清空 Claude Code session id"),
+                ("4", "转移绑定", "将 Claude Code session id 从旧 ccd 转到新 ccd"),
+                ("0", "返回", "回到主菜单"),
+            ],
+        )
+        choice = prompt("请选择: ")
+        if choice == "1":
+            map_bind()
+        elif choice == "2":
+            map_import()
+        elif choice == "3":
+            map_unbind()
+        elif choice == "4":
+            map_bind(force_transfer=True)
+        elif choice in {"0", "q", "Q"}:
+            return 0
+        else:
+            print(red("无效选项。"))
+
+
+def cmd_doctor(_: list[str]) -> int:
+    problems = 0
+    print_header(f"{APP_NAME} doctor", "只报告问题，不自动修改状态。")
+    for label, path in (("配置", CONFIG_PATH), ("注册表", REGISTRY_PATH)):
+        if path.exists():
+            try:
+                load_json(path, {})
+                print(f"{green('OK ')} {label}: {dim(str(path))}")
+            except Exception as exc:
+                print(f"{red('ERR')} {label} JSON 无效: {exc}")
+                problems += 1
+        else:
+            print(f"{red('ERR')} {label} 不存在: {path}")
+            problems += 1
+
+    if is_hook_installed():
+        print(f"{green('OK ')} SessionStart hook 已安装: {dim(str(CLAUDE_SETTINGS_PATH))}")
+    else:
+        print(f"{red('ERR')} SessionStart hook 未安装: {CLAUDE_SETTINGS_PATH}")
+        problems += 1
+
+    try:
+        config = load_config()
+        root_names = [r.get("name") for r in config.get("roots", [])]
+        root_paths = [str(normalize_path(r.get("path", ""))) for r in config.get("roots", [])]
+        if len(root_names) != len(set(root_names)):
+            print(f"{red('ERR')} root 名重复")
+            problems += 1
+        if len(root_paths) != len(set(root_paths)):
+            print(f"{red('ERR')} root 路径重复")
+            problems += 1
+        for root in config.get("roots", []):
+            if Path(root.get("path", "")).expanduser().is_dir():
+                print(f"{green('OK ')} root: {bold(root.get('name'))} {dim(root.get('path'))}")
+            else:
+                print(f"{yellow('WARN')} root 不存在或不是目录: {root.get('name')} {root.get('path')}")
+    except Exception as exc:
+        print(f"{red('ERR')} 读取配置失败: {exc}")
+        problems += 1
+
+    raw_ids = {s.id for s in load_claude_sessions()}
+    try:
+        registry = load_registry()
+        names = [s.get("name") for s in registry.get("sessions", [])]
+        claude_ids = [s.get("claude_session_id") for s in registry.get("sessions", []) if s.get("claude_session_id")]
+        if len(names) != len(set(names)):
+            print(f"{red('ERR')} ccd_name 重复")
+            problems += 1
+        if len(claude_ids) != len(set(claude_ids)):
+            print(f"{red('ERR')} claude_session_id 重复绑定")
+            problems += 1
+        for session in sorted_sessions(registry):
+            prefix = f"{session.get('name')} ({session.get('id')})"
+            status = tmux_status(session)
+            bound = session.get("claude_session_id")
+            binding = "yes" if bound else "no"
+            print(f"{green('OK ')} session {bold(prefix)}: tmux={status_text(status)} binding={status_text('bound') if bound else dim(binding)}")
+            if bound and bound not in raw_ids:
+                print(f"{yellow('WARN')} {prefix}: Claude Code 原始会话不在本地索引/rollout 中: {bound}")
+            cwd = session.get("last_cwd")
+            if cwd and not Path(cwd).is_dir():
+                print(f"{yellow('WARN')} {prefix}: last_cwd 不存在: {cwd}")
+    except Exception as exc:
+        print(f"{red('ERR')} 读取注册表失败: {exc}")
+        problems += 1
+
+    if problems:
+        print(rule())
+        print(red(f"doctor 完成，发现 {problems} 个错误。"))
+        return 1
+    print(rule())
+    print(green("doctor 完成，没有发现阻塞性错误。"))
+    return 0
+
+
+def cmd_runner(args: list[str]) -> int:
+    if not args:
+        print("missing ccd id", file=sys.stderr)
+        return 2
+    session_id = args[0]
+    try:
+        registry = load_registry()
+        session = find_session_by_id(registry, session_id)
+        if not session:
+            print(f"ccd runner: 注册表中找不到会话 {session_id}")
+            input("按 Enter 退出...")
+            return 1
+        cwd = session.get("last_cwd") or str(HOME)
+        if not Path(cwd).is_dir():
+            print(f"ccd runner: 工作目录不存在: {cwd}")
+            print("请退出后运行 ccd doctor 或 ccd enter 修复。")
+            input("按 Enter 退出...")
+            return 1
+        os.chdir(cwd)
+        env = os.environ.copy()
+        env["CCD_SESSION_ID"] = session["id"]
+        env["CCD_NAME"] = session["name"]
+        env["CCD_REGISTRY"] = str(REGISTRY_PATH)
+        args = ["claude", "--name", session["name"]]
+        if session.get("claude_session_id"):
+            args = ["claude", "--resume", session["claude_session_id"]]
+        log_event(f"runner starting {' '.join(args)} for ccd id={session['id']}")
+        result = subprocess.run(args, env=env)
+        if result.returncode != 0:
+            log_event(f"runner claude exited rc={result.returncode} ccd id={session['id']}")
+            print(f"\nClaude Code 退出码：{result.returncode}")
+            print("如果是 resume 失败，请运行 ccd map 或 ccd doctor 修复映射。")
+            try:
+                input("按 Enter 退出 tmux...")
+            except EOFError:
+                pass
+        return result.returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_hook_session_start(_: list[str]) -> int:
+    ccd_id = os.environ.get("CCD_SESSION_ID")
+    if not ccd_id:
+        return 0
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        log_event(f"hook invalid json ccd_id={ccd_id}: {exc}")
+        return 0
+    claude_id = payload.get("session_id") or payload.get("thread_id") or payload.get("id")
+    if not claude_id:
+        log_event(f"hook missing session_id ccd_id={ccd_id}")
+        return 0
+    cwd = payload.get("cwd")
+    transcript_path = payload.get("transcript_path")
+    source = payload.get("source")
+    with registry_lock():
+        registry = load_registry()
+        session = find_session_by_id(registry, ccd_id)
+        if not session:
+            log_event(f"hook ccd session not found ccd_id={ccd_id} claude_id={claude_id}")
+            return 0
+        existing = session.get("claude_session_id")
+        if existing and existing != claude_id:
+            log_event(f"hook conflict ccd_id={ccd_id} existing={existing} incoming={claude_id} source={source}")
+            return 0
+        ts = now_utc()
+        session["claude_session_id"] = claude_id
+        if cwd:
+            session["last_cwd"] = cwd
+        if transcript_path:
+            session["transcript_path"] = transcript_path
+        session["last_used_at"] = ts
+        session["updated_at"] = ts
+        save_registry(registry)
+    log_event(f"hook mapped ccd_id={ccd_id} claude_id={claude_id} source={source}")
+    return 0
+
+
+def main_menu() -> int:
+    while True:
+        registry = load_registry()
+        count = len(registry.get("sessions", []))
+        live_count = sum(1 for session in registry.get("sessions", []) if tmux_exists(session["tmux_session"]))
+        subtitle = f"{count} 个 ccd 会话 · {live_count} 个 live tmux"
+        print_menu(
+            APP_NAME,
+            [
+                ("1", "进入会话", "attach 到 live tmux，或自动 resume Claude Code"),
+                ("2", "新建会话", "选择常用目录，创建一个新的 Claude Code 工作台"),
+                ("3", "删除会话", "kill tmux 并删除 ccd 映射，不删 Claude Code 历史"),
+                ("4", "重命名会话", "修改用途名，live 会话也支持"),
+                ("5", "手动映射/导入", "绑定、导入、解除或转移 Claude Code 原始会话"),
+                ("6", "管理常用目录", "维护新建会话时可选的 root"),
+                ("7", "检查状态 doctor", "只报告问题，不自动修复"),
+                ("8", "查看 session id", "显示 ccd 会话绑定的 Claude Code session id"),
+                ("0", "退出", "离开 ccd 菜单"),
+            ],
+            subtitle,
+            banner=True,
+        )
+        choice = prompt("请选择: ")
+        if choice == "1":
+            cmd_enter([])
+        elif choice == "2":
+            cmd_new([])
+        elif choice == "3":
+            cmd_delete([])
+        elif choice == "4":
+            cmd_rename([])
+        elif choice == "5":
+            cmd_map([])
+        elif choice == "6":
+            cmd_roots([])
+        elif choice == "7":
+            cmd_doctor([])
+        elif choice == "8":
+            cmd_uuid([])
+        elif choice in {"0", "q", "Q"}:
+            return 0
+        else:
+            print(red("无效选项。"))
+
+
+def usage() -> str:
+    return """用法:
+  ccd                       打开菜单
+  ccd list                  列出 ccd 会话
+  ccd list --json           输出机器可读会话列表
+  ccd new [ccd_name]        新建会话；同名则进入
+  ccd new --cwd PATH --no-enter --json [ccd_name]
+  ccd enter [ccd_name]      进入会话
+  ccd enter --new-if-unbound [ccd_name]
+  ccd enter --print-command [ccd_name]
+  ccd uuid [ccd_name]       查看绑定的 Claude Code session id
+  ccd uuid --all            列出所有 ccd 会话的绑定 ID
+  ccd delete [--yes] [ccd_name]
+  ccd rename [--json] OLD NEW
+  ccd roots                 管理常用目录
+  ccd map                   手动映射/导入 Claude Code 原始会话
+  ccd doctor                只报告状态问题
+  ccd init                  初始化并安装 hook
+  ccd install-hook          安装/刷新 Claude Code hook
+"""
+
+
+def dispatch(argv: list[str]) -> int:
+    if not argv:
+        if not ensure_initialized():
+            return 1
+        return main_menu()
+    cmd, rest = argv[0], argv[1:]
+    if cmd in {"-h", "--help", "help"}:
+        print(usage())
+        return 0
+    if cmd == "__runner":
+        return cmd_runner(rest)
+    if cmd == "__hook-session-start":
+        return cmd_hook_session_start(rest)
+    if cmd == "init":
+        return cmd_init()
+    if cmd == "install-hook":
+        return 0 if install_hook_interactive(auto=False) else 1
+    if cmd == "doctor":
+        return cmd_doctor(rest)
+    if not ensure_initialized():
+        return 1
+    commands = {
+        "list": cmd_list,
+        "ls": cmd_list,
+        "new": cmd_new,
+        "add": cmd_new,
+        "create": cmd_new,
+        "enter": cmd_enter,
+        "open": cmd_enter,
+        "uuid": cmd_uuid,
+        "id": cmd_uuid,
+        "claude-id": cmd_uuid,
+        "session-id": cmd_uuid,
+        "delete": cmd_delete,
+        "del": cmd_delete,
+        "rm": cmd_delete,
+        "rename": cmd_rename,
+        "ren": cmd_rename,
+        "mv": cmd_rename,
+        "roots": cmd_roots,
+        "root": cmd_roots,
+        "map": cmd_map,
+        "import": lambda a: map_import(),
+    }
+    handler = commands.get(cmd)
+    if not handler:
+        print(f"未知命令: {cmd}")
+        print(usage())
+        return 1
+    return handler(rest)
+
+
+def main() -> int:
+    try:
+        return dispatch(sys.argv[1:])
+    except CcdError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
