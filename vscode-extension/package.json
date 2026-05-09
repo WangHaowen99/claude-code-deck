@@ -5,6 +5,11 @@
   "version": "0.1.0",
   "publisher": "claude-code-deck",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WangHaowen99/claude-code-deck.git",
+    "directory": "vscode-extension"
+  },
   "engines": {
     "vscode": "^1.86.0"
   },

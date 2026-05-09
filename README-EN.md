@@ -181,6 +181,18 @@ ccd install-hook          # refresh Claude Code hook
 
 `vscode-extension/` provides a small sidebar extension for listing, creating, opening, renaming, deleting, and copying session ids.
 
+Download the compiled VSIX:
+
+[claude-code-deck-0.1.0.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.0.vsix)
+
+Install after download:
+
+```bash
+code --install-extension claude-code-deck-0.1.0.vsix
+```
+
+Build from source:
+
 ```bash
 cd vscode-extension
 npm install

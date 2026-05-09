@@ -181,6 +181,18 @@ ccd install-hook          # 安装/刷新 Claude Code hook
 
 `vscode-extension/` 提供一个轻量侧栏扩展，用来列出、创建、打开、重命名、删除和复制 session id。
 
+直接下载编译好的 VSIX：
+
+[claude-code-deck-0.1.0.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.0.vsix)
+
+下载后安装：
+
+```bash
+code --install-extension claude-code-deck-0.1.0.vsix
+```
+
+从源码编译：
+
 ```bash
 cd vscode-extension
 npm install
