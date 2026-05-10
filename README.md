@@ -86,6 +86,7 @@ Claude Code SessionStart hook 回写真实 session id
 | 会话列表 | 只展示 ccd 管理的会话，按最近使用时间排序 |
 | 新建会话 | 输入全局唯一用途名，选择常用目录，可选创建子目录 |
 | 进入会话 | 优先 attach 到 live tmux，否则自动 `claude --resume` |
+| 未读提醒 | transcript 晚于上次进入时间时，在 ccd 列表和 VS Code 插件里显示未查看结果 |
 | 鼠标滚动 | 刷新 tmux 鼠标模式并接管滚轮，减少窄屏误操作 |
 | Session ID 查询 | 显示某个 ccd 会话绑定的 Claude Code session id |
 | 删除会话 | kill 对应 tmux，删除 ccd 映射，不删除 Claude Code 原始历史 |

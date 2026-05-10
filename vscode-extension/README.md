@@ -11,6 +11,12 @@ It does not reimplement Claude Code Deck. It calls the remote/workspace `ccd` co
 - `ccd enter <ccd_name>`
 - `ccd enter --new-if-unbound <ccd_name>`
 
+Unread Claude Code results are shown in the session description. When `ccd list --json`
+reports `unread: true`, the tree item uses a red dot icon.
+
+Opening the same ccd session again reuses the existing VS Code terminal. Closing
+that terminal clears the cache, so the next open creates a fresh terminal.
+
 ## Development
 
 ```bash

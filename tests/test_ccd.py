@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +24,12 @@ def load_ccd():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def write_transcript(path: Path, mtime: datetime) -> None:
+    path.write_text('{"type":"assistant","message":{"content":"done"}}\n', encoding="utf-8")
+    timestamp = mtime.timestamp()
+    os.utime(path, (timestamp, timestamp))
 
 
 class CcdTests(unittest.TestCase):
@@ -189,6 +196,81 @@ class CcdTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(seen[0][0], ["claude", "--resume", sid])
         self.assertEqual(seen[0][1]["CCD_SESSION_ID"], "deck1")
+
+    def test_unbound_session_is_never_unread(self):
+        session = {
+            "id": "deck1",
+            "name": "work",
+            "tmux_session": "ccd_deck1",
+            "claude_session_id": None,
+        }
+
+        self.assertFalse(self.ccd.session_has_unread_result(session))
+
+    def test_transcript_newer_than_last_viewed_is_unread(self):
+        transcript = self.root / "session.jsonl"
+        write_transcript(transcript, datetime(2026, 5, 9, 8, 30, tzinfo=timezone.utc))
+        session = {
+            "id": "deck1",
+            "name": "work",
+            "tmux_session": "ccd_deck1",
+            "claude_session_id": "claude-1",
+            "transcript_path": str(transcript),
+            "last_viewed_at": "2026-05-09T08:00:00Z",
+        }
+
+        self.assertTrue(self.ccd.session_has_unread_result(session))
+
+    def test_session_json_includes_view_state(self):
+        transcript = self.root / "session.jsonl"
+        write_transcript(transcript, datetime(2026, 5, 9, 8, 30, tzinfo=timezone.utc))
+        session = {
+            "id": "deck1",
+            "name": "work",
+            "tmux_session": "ccd_deck1",
+            "claude_session_id": "claude-1",
+            "transcript_path": str(transcript),
+            "last_viewed_at": "2026-05-09T08:00:00Z",
+        }
+
+        data = self.ccd.session_json(session, include_status=False)
+
+        self.assertTrue(data["unread"])
+        self.assertEqual(data["last_viewed_at"], "2026-05-09T08:00:00Z")
+        self.assertIsNotNone(data["conversation_updated_at"])
+
+    def test_touch_last_used_can_mark_conversation_viewed(self):
+        self.ccd.ensure_dirs()
+        transcript = self.root / "session.jsonl"
+        write_transcript(transcript, datetime(2026, 5, 9, 8, 30, tzinfo=timezone.utc))
+        self.ccd.save_registry(
+            {
+                "version": self.ccd.VERSION,
+                "sessions": [
+                    {
+                        "id": "deck1",
+                        "name": "work",
+                        "tmux_session": "ccd_deck1",
+                        "claude_session_id": "claude-1",
+                        "last_cwd": str(self.root),
+                        "created_at": "2026-05-09T07:00:00Z",
+                        "updated_at": "2026-05-09T07:00:00Z",
+                        "last_used_at": "2026-05-09T07:00:00Z",
+                        "last_viewed_at": "2026-05-09T08:00:00Z",
+                        "transcript_path": str(transcript),
+                    }
+                ],
+            }
+        )
+
+        self.ccd.touch_last_used("deck1", mark_viewed=True)
+
+        saved = self.ccd.load_registry()["sessions"][0]
+        self.assertFalse(self.ccd.session_has_unread_result(saved))
+        self.assertEqual(
+            saved["last_viewed_at"],
+            self.ccd.later_time(saved["last_used_at"], self.ccd.session_conversation_updated_at(saved)),
+        )
 
 
 if __name__ == "__main__":

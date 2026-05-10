@@ -86,6 +86,7 @@ Claude Code SessionStart hook writes back the real session id
 | Session list | Shows only ccd-managed sessions, sorted by recent use |
 | New session | Choose a root directory and optionally create a subdirectory |
 | Enter session | Attach to live tmux or resume Claude Code automatically |
+| Unread reminder | Shows unread results in the ccd list and VS Code extension when the transcript is newer than the last entered time |
 | Mouse scrolling | Refreshes tmux mouse mode and intercepts wheel events for narrow terminals |
 | Session ID lookup | Show the Claude Code session id bound to a ccd workspace |
 | Delete session | Kill tmux and remove the ccd mapping, preserving Claude Code history |

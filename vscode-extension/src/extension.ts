@@ -1,6 +1,7 @@
 import * as vscode from 'vscode'
 import { execFile } from 'child_process'
 import * as os from 'os'
+import { TerminalRegistry } from './terminalRegistry'
 
 interface CcdSession {
   id: string
@@ -8,6 +9,9 @@ interface CcdSession {
   tmux_session: string
   claude_session_id?: string | null
   bound: boolean
+  unread?: boolean
+  last_viewed_at?: string | null
+  conversation_updated_at?: string | null
   last_cwd?: string | null
   created_at?: string | null
   updated_at?: string | null
@@ -102,9 +106,9 @@ class SessionItem extends vscode.TreeItem {
   constructor (readonly session: CcdSession) {
     super(session.name, vscode.TreeItemCollapsibleState.None)
     this.contextValue = 'ccdSession'
-    this.description = [session.tmux_status || 'unknown', session.bound ? 'bound' : 'unbound'].join(' ')
+    this.description = sessionDescription(session)
     this.tooltip = tooltipFor(session)
-    this.iconPath = new vscode.ThemeIcon(session.tmux_status === 'live' ? 'debug-console' : 'terminal')
+    this.iconPath = sessionIcon(session)
     this.command = {
       command: 'claudeCodeDeck.openSession',
       title: 'Open Session',
@@ -139,8 +143,8 @@ class SessionsProvider implements vscode.TreeDataProvider<SessionItem> {
     }
     const picked = await vscode.window.showQuickPick(
       this.sessions.map(session => ({
-        label: session.name,
-        description: [session.tmux_status || 'unknown', session.bound ? 'bound' : 'unbound'].join(' '),
+        label: session.unread ? `$(circle-filled) ${session.name}` : session.name,
+        description: sessionDescription(session),
         detail: session.last_cwd || undefined,
         session
       })),
@@ -154,13 +158,15 @@ export function activate (context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Claude Code Deck')
   const client = new CcdClient(output)
   const provider = new SessionsProvider(client)
+  const terminals = new TerminalRegistry<vscode.Terminal>()
 
   context.subscriptions.push(
     output,
     vscode.window.registerTreeDataProvider('claudeCodeDeck.sessions', provider),
     vscode.commands.registerCommand('claudeCodeDeck.refresh', async () => runAction('Refresh Claude Code Deck', () => provider.refresh())),
-    vscode.commands.registerCommand('claudeCodeDeck.newSession', async () => newSession(provider)),
-    vscode.commands.registerCommand('claudeCodeDeck.openSession', async item => openSession(provider, item)),
+    vscode.window.onDidCloseTerminal(terminal => terminals.deleteTerminal(terminal)),
+    vscode.commands.registerCommand('claudeCodeDeck.newSession', async () => newSession(provider, terminals)),
+    vscode.commands.registerCommand('claudeCodeDeck.openSession', async item => openSession(provider, terminals, item)),
     vscode.commands.registerCommand('claudeCodeDeck.renameSession', async item => renameSession(provider, item)),
     vscode.commands.registerCommand('claudeCodeDeck.deleteSession', async item => deleteSession(provider, item)),
     vscode.commands.registerCommand('claudeCodeDeck.copyUuid', async item => copyUuid(provider, item))
@@ -171,7 +177,7 @@ export function activate (context: vscode.ExtensionContext): void {
 
 export function deactivate (): void {}
 
-async function newSession (provider: SessionsProvider): Promise<void> {
+async function newSession (provider: SessionsProvider, terminals: TerminalRegistry<vscode.Terminal>): Promise<void> {
   const name = await vscode.window.showInputBox({
     prompt: 'ccd_name',
     ignoreFocusOut: true,
@@ -197,16 +203,16 @@ async function newSession (provider: SessionsProvider): Promise<void> {
     return created
   })
   if (session) {
-    openTerminalFor(session, provider.client.executable, { newIfUnbound: true })
+    openTerminalFor(session, provider.client.executable, terminals, { newIfUnbound: true })
   }
 }
 
-async function openSession (provider: SessionsProvider, item: unknown): Promise<void> {
+async function openSession (provider: SessionsProvider, terminals: TerminalRegistry<vscode.Terminal>, item: unknown): Promise<void> {
   const session = await sessionFrom(provider, item, 'Open which Claude Code Deck session?')
   if (!session) {
     return
   }
-  openTerminalFor(session, provider.client.executable)
+  openTerminalFor(session, provider.client.executable, terminals)
   void provider.refresh().catch(error => showError(error))
 }
 
@@ -272,11 +278,23 @@ async function sessionFrom (provider: SessionsProvider, item: unknown, placehold
   return provider.pickSession(placeholder)
 }
 
-function openTerminalFor (session: CcdSession, ccdPath: string, options: { newIfUnbound?: boolean } = {}): void {
+function openTerminalFor (
+  session: CcdSession,
+  ccdPath: string,
+  terminals: TerminalRegistry<vscode.Terminal>,
+  options: { newIfUnbound?: boolean } = {}
+): void {
+  const terminalKey = sessionTerminalKey(session)
+  const existing = terminals.get(terminalKey)
+  if (existing) {
+    existing.show()
+    return
+  }
   const terminal = vscode.window.createTerminal({
     name: session.name,
     cwd: session.last_cwd || undefined
   })
+  terminals.set(terminalKey, terminal)
   terminal.show()
   const args = ['enter']
   if (options.newIfUnbound) {
@@ -284,6 +302,10 @@ function openTerminalFor (session: CcdSession, ccdPath: string, options: { newIf
   }
   args.push(session.name)
   terminal.sendText([ccdPath, ...args].map(shellQuote).join(' '))
+}
+
+function sessionTerminalKey (session: CcdSession): string {
+  return session.id || session.tmux_session || session.name
 }
 
 async function runAction<T> (title: string, action: () => Promise<T>): Promise<T | undefined> {
@@ -332,7 +354,8 @@ function tooltipFor (session: CcdSession): string {
   const lines = [
     session.name,
     `tmux: ${session.tmux_status || 'unknown'}`,
-    `binding: ${session.bound ? 'bound' : 'unbound'}`
+    `binding: ${session.bound ? 'bound' : 'unbound'}`,
+    `result: ${viewState(session)}`
   ]
   if (session.last_cwd) {
     lines.push(`cwd: ${session.last_cwd}`)
@@ -340,7 +363,35 @@ function tooltipFor (session: CcdSession): string {
   if (session.claude_session_id) {
     lines.push(`session id: ${session.claude_session_id}`)
   }
+  if (session.last_viewed_at) {
+    lines.push(`last viewed: ${session.last_viewed_at}`)
+  }
+  if (session.conversation_updated_at) {
+    lines.push(`conversation updated: ${session.conversation_updated_at}`)
+  }
   return lines.join('\n')
+}
+
+function sessionDescription (session: CcdSession): string {
+  return [
+    session.tmux_status || 'unknown',
+    session.bound ? 'bound' : 'unbound',
+    viewState(session)
+  ].join(' ')
+}
+
+function sessionIcon (session: CcdSession): vscode.ThemeIcon {
+  if (session.unread) {
+    return new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('testing.iconFailed'))
+  }
+  return new vscode.ThemeIcon(session.tmux_status === 'live' ? 'debug-console' : 'terminal')
+}
+
+function viewState (session: CcdSession): string {
+  if (!session.bound) {
+    return 'no-result'
+  }
+  return session.unread ? 'unread' : 'viewed'
 }
 
 function isSession (value: unknown): value is CcdSession {
