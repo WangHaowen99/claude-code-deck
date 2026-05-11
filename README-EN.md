@@ -83,10 +83,10 @@ Claude Code SessionStart hook writes back the real session id
 
 | Feature | Description |
 |:---|:---|
-| Session list | Shows only ccd-managed sessions, sorted by recent use |
+| Session list | Shows only ccd-managed sessions; the CLI is sorted by recent use, and the VS Code sidebar keeps stable creation-time ordering |
 | New session | Choose a root directory and optionally create a subdirectory |
 | Enter session | Attach to live tmux or resume Claude Code automatically |
-| Unread and activity state | Shows unread results when the transcript is newer than the last viewed time; running sessions show an elapsed-time animation in the VS Code sidebar |
+| Unread and activity state | Shows unread results when the transcript is newer than the last viewed time; running sessions show an orange dot and elapsed time in the VS Code sidebar |
 | Mouse scrolling | Refreshes tmux mouse mode and intercepts wheel events for narrow terminals |
 | Session ID lookup | Show the Claude Code session id bound to a ccd workspace |
 | Delete session | Kill tmux and remove the ccd mapping, preserving Claude Code history |
@@ -185,12 +185,12 @@ ccd install-hook          # refresh Claude Code hook
 
 Download the compiled VSIX:
 
-[claude-code-deck-0.1.2.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.2.vsix)
+[claude-code-deck-0.1.3.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.3.vsix)
 
 Install after download:
 
 ```bash
-code --install-extension claude-code-deck-0.1.2.vsix
+code --install-extension claude-code-deck-0.1.3.vsix
 ```
 
 Build from source:

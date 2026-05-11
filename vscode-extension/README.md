@@ -13,7 +13,7 @@ It does not reimplement Claude Code Deck. It calls the remote/workspace `ccd` co
 - `ccd mark-viewed --json <ccd_name>`
 
 Unread Claude Code results are shown with a red dot. Viewed bound sessions use a
-green dot. Running sessions show a small animated spinner and elapsed time.
+green dot. Running sessions show an orange dot and elapsed time.
 
 Opening a session marks it viewed through `ccd mark-viewed --json`, which clears
 the unread state after the terminal opens.
