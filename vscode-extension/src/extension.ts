@@ -2,6 +2,14 @@ import * as vscode from 'vscode'
 import { execFile } from 'child_process'
 import * as os from 'os'
 import { TerminalRegistry } from './terminalRegistry'
+import {
+  RUNNING_ICON_FRAME_COUNT,
+  formatElapsed,
+  isRunning,
+  runningElapsedSeconds,
+  runningIconFrameFile,
+  sessionDescription
+} from './sessionView'
 
 interface CcdSession {
   id: string
@@ -10,6 +18,9 @@ interface CcdSession {
   claude_session_id?: string | null
   bound: boolean
   unread?: boolean
+  activity_state?: string | null
+  activity_started_at?: string | null
+  activity_elapsed_seconds?: number | null
   last_viewed_at?: string | null
   conversation_updated_at?: string | null
   last_cwd?: string | null
@@ -74,6 +85,15 @@ class CcdClient {
     }
   }
 
+  async markViewed (name: string): Promise<CcdSession> {
+    const stdout = await this.run(['mark-viewed', '--json', name])
+    const data = parseJson<CcdSessionResult>(stdout)
+    if (!data.ok || !data.session) {
+      throw new Error(data.error || 'ccd mark-viewed failed')
+    }
+    return data.session
+  }
+
   private run (args: string[]): Promise<string> {
     this.output.appendLine(`$ ${this.executable} ${args.map(shellQuote).join(' ')}`)
     return new Promise((resolve, reject) => {
@@ -103,12 +123,16 @@ class CcdClient {
 }
 
 class SessionItem extends vscode.TreeItem {
-  constructor (readonly session: CcdSession) {
+  constructor (
+    readonly session: CcdSession,
+    extensionUri: vscode.Uri,
+    animationFrame: number
+  ) {
     super(session.name, vscode.TreeItemCollapsibleState.None)
     this.contextValue = 'ccdSession'
-    this.description = sessionDescription(session)
+    this.description = sessionDescription(session) || undefined
     this.tooltip = tooltipFor(session)
-    this.iconPath = sessionIcon(session)
+    this.iconPath = sessionIcon(session, extensionUri, animationFrame)
     this.command = {
       command: 'claudeCodeDeck.openSession',
       title: 'Open Session',
@@ -121,19 +145,31 @@ class SessionsProvider implements vscode.TreeDataProvider<SessionItem> {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<SessionItem | undefined | null | void>()
   readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event
   private sessions: CcdSession[] = []
+  private animationFrame = 0
 
-  constructor (readonly client: CcdClient) {}
+  constructor (
+    readonly client: CcdClient,
+    private readonly extensionUri: vscode.Uri
+  ) {}
 
   getTreeItem (element: SessionItem): vscode.TreeItem {
     return element
   }
 
   getChildren (): SessionItem[] {
-    return this.sessions.map(session => new SessionItem(session))
+    return this.sessions.map(session => new SessionItem(session, this.extensionUri, this.animationFrame))
   }
 
   async refresh (): Promise<void> {
     this.sessions = await this.client.list()
+    this.onDidChangeTreeDataEmitter.fire()
+  }
+
+  tickAnimation (): void {
+    if (!this.sessions.some(isRunning)) {
+      return
+    }
+    this.animationFrame = (this.animationFrame + 1) % RUNNING_ICON_FRAME_COUNT
     this.onDidChangeTreeDataEmitter.fire()
   }
 
@@ -143,8 +179,8 @@ class SessionsProvider implements vscode.TreeDataProvider<SessionItem> {
     }
     const picked = await vscode.window.showQuickPick(
       this.sessions.map(session => ({
-        label: session.unread ? `$(circle-filled) ${session.name}` : session.name,
-        description: sessionDescription(session),
+        label: `${sessionIconLabel(session)} ${session.name}`.trim(),
+        description: sessionDescription(session) || undefined,
         detail: session.last_cwd || undefined,
         session
       })),
@@ -157,7 +193,7 @@ class SessionsProvider implements vscode.TreeDataProvider<SessionItem> {
 export function activate (context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Claude Code Deck')
   const client = new CcdClient(output)
-  const provider = new SessionsProvider(client)
+  const provider = new SessionsProvider(client, context.extensionUri)
   const terminals = new TerminalRegistry<vscode.Terminal>()
 
   context.subscriptions.push(
@@ -171,6 +207,16 @@ export function activate (context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('claudeCodeDeck.deleteSession', async item => deleteSession(provider, item)),
     vscode.commands.registerCommand('claudeCodeDeck.copyUuid', async item => copyUuid(provider, item))
   )
+
+  const refreshTimer = setInterval(() => {
+    void provider.refresh().catch(error => output.appendLine(error instanceof Error ? error.message : String(error)))
+  }, 5000)
+  context.subscriptions.push({ dispose: () => clearInterval(refreshTimer) })
+
+  const animationTimer = setInterval(() => {
+    provider.tickAnimation()
+  }, 250)
+  context.subscriptions.push({ dispose: () => clearInterval(animationTimer) })
 
   void provider.refresh().catch(error => showError(error))
 }
@@ -213,7 +259,7 @@ async function openSession (provider: SessionsProvider, terminals: TerminalRegis
     return
   }
   openTerminalFor(session, provider.client.executable, terminals)
-  void provider.refresh().catch(error => showError(error))
+  void markSessionViewed(provider, session).catch(error => showError(error))
 }
 
 async function renameSession (provider: SessionsProvider, item: unknown): Promise<void> {
@@ -266,6 +312,11 @@ async function copyUuid (provider: SessionsProvider, item: unknown): Promise<voi
   }
   await vscode.env.clipboard.writeText(session.claude_session_id)
   vscode.window.showInformationMessage(`Copied session ID for "${session.name}".`)
+}
+
+async function markSessionViewed (provider: SessionsProvider, session: CcdSession): Promise<void> {
+  await provider.client.markViewed(session.name)
+  await provider.refresh()
 }
 
 async function sessionFrom (provider: SessionsProvider, item: unknown, placeholder: string): Promise<CcdSession | undefined> {
@@ -353,10 +404,11 @@ function defaultCwd (): string {
 function tooltipFor (session: CcdSession): string {
   const lines = [
     session.name,
-    `tmux: ${session.tmux_status || 'unknown'}`,
-    `binding: ${session.bound ? 'bound' : 'unbound'}`,
-    `result: ${viewState(session)}`
+    `status: ${viewState(session)}`
   ]
+  if (isRunning(session)) {
+    lines.push(`elapsed: ${formatElapsed(runningElapsedSeconds(session))}`)
+  }
   if (session.last_cwd) {
     lines.push(`cwd: ${session.last_cwd}`)
   }
@@ -372,24 +424,35 @@ function tooltipFor (session: CcdSession): string {
   return lines.join('\n')
 }
 
-function sessionDescription (session: CcdSession): string {
-  return [
-    session.tmux_status || 'unknown',
-    session.bound ? 'bound' : 'unbound',
-    viewState(session)
-  ].join(' ')
-}
-
-function sessionIcon (session: CcdSession): vscode.ThemeIcon {
-  if (session.unread) {
+function sessionIcon (session: CcdSession, extensionUri: vscode.Uri, animationFrame: number): vscode.ThemeIcon | vscode.Uri {
+  if (isRunning(session)) {
+    return vscode.Uri.joinPath(extensionUri, 'media', runningIconFrameFile(animationFrame))
+  }
+  if (session.activity_state === 'unread' || session.unread) {
     return new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('testing.iconFailed'))
+  }
+  if (session.activity_state === 'read' || session.bound) {
+    return new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('testing.iconPassed'))
   }
   return new vscode.ThemeIcon(session.tmux_status === 'live' ? 'debug-console' : 'terminal')
 }
 
+function sessionIconLabel (session: CcdSession): string {
+  if (isRunning(session)) {
+    return '$(loading~spin)'
+  }
+  if (session.activity_state === 'unread' || session.unread) {
+    return '$(circle-filled)'
+  }
+  if (session.activity_state === 'read' || session.bound) {
+    return '$(pass-filled)'
+  }
+  return ''
+}
+
 function viewState (session: CcdSession): string {
-  if (!session.bound) {
-    return 'no-result'
+  if (session.activity_state) {
+    return session.activity_state
   }
   return session.unread ? 'unread' : 'viewed'
 }

@@ -86,7 +86,7 @@ Claude Code SessionStart hook 回写真实 session id
 | 会话列表 | 只展示 ccd 管理的会话，按最近使用时间排序 |
 | 新建会话 | 输入全局唯一用途名，选择常用目录，可选创建子目录 |
 | 进入会话 | 优先 attach 到 live tmux，否则自动 `claude --resume` |
-| 未读提醒 | transcript 晚于上次进入时间时，在 ccd 列表和 VS Code 插件里显示未查看结果 |
+| 未读与运行状态 | transcript 晚于上次查看时间时显示未读；运行中会话在 VS Code 侧边栏显示计时动画 |
 | 鼠标滚动 | 刷新 tmux 鼠标模式并接管滚轮，减少窄屏误操作 |
 | Session ID 查询 | 显示某个 ccd 会话绑定的 Claude Code session id |
 | 删除会话 | kill 对应 tmux，删除 ccd 映射，不删除 Claude Code 原始历史 |
@@ -167,6 +167,7 @@ ccd new --cwd PATH --no-enter --json [ccd_name]
 ccd enter [ccd_name]      # 进入会话
 ccd enter --new-if-unbound [ccd_name]
 ccd enter --print-command [ccd_name]
+ccd mark-viewed --json [ccd_name]
 ccd uuid [ccd_name]       # 查看绑定的 Claude Code session id
 ccd uuid --all            # 列出所有 ccd 会话的绑定 ID
 ccd delete [--yes] [ccd_name]
@@ -184,12 +185,12 @@ ccd install-hook          # 安装/刷新 Claude Code hook
 
 直接下载编译好的 VSIX：
 
-[claude-code-deck-0.1.0.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.0.vsix)
+[claude-code-deck-0.1.1.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.1.vsix)
 
 下载后安装：
 
 ```bash
-code --install-extension claude-code-deck-0.1.0.vsix
+code --install-extension claude-code-deck-0.1.1.vsix
 ```
 
 从源码编译：

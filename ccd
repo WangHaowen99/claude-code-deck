@@ -528,6 +528,27 @@ def path_mtime_iso(path: str | None) -> str | None:
     return datetime.fromtimestamp(mtime, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def find_claude_transcript_path(claude_id: str | None) -> str | None:
+    if not claude_id or not CLAUDE_PROJECTS_DIR.exists():
+        return None
+    try:
+        matches = [path for path in CLAUDE_PROJECTS_DIR.glob(f"**/{claude_id}.jsonl") if path.is_file()]
+    except OSError:
+        return None
+    if not matches:
+        return None
+    matches.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+    return str(matches[0])
+
+
+def resolve_session_transcript_path(session: dict[str, Any]) -> str | None:
+    transcript_path = session.get("transcript_path")
+    if transcript_path and Path(transcript_path).exists():
+        return transcript_path
+    resolved = find_claude_transcript_path(session.get("claude_session_id"))
+    return resolved or transcript_path
+
+
 def later_time(left: str | None, right: str | None) -> str | None:
     left_dt = parse_iso(left)
     right_dt = parse_iso(right)
@@ -537,7 +558,58 @@ def later_time(left: str | None, right: str | None) -> str | None:
 
 
 def session_conversation_updated_at(session: dict[str, Any]) -> str | None:
-    return path_mtime_iso(session.get("transcript_path"))
+    return path_mtime_iso(resolve_session_transcript_path(session))
+
+
+def transcript_task_window(path: str | None, *, max_lines: int = 1200) -> tuple[str | None, str | None]:
+    if not path:
+        return None, None
+    transcript = Path(path)
+    if not transcript.exists():
+        return None, None
+    try:
+        lines = transcript.read_text(encoding="utf-8", errors="ignore").splitlines()[-max_lines:]
+    except OSError:
+        return None, None
+    latest_started: str | None = None
+    latest_complete: str | None = None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        timestamp = item.get("timestamp")
+        if not isinstance(timestamp, str) or not parse_iso(timestamp):
+            continue
+        item_type = item.get("type")
+        if item_type == "user" and not item.get("isMeta"):
+            latest_started = timestamp
+            continue
+        if item_type == "assistant":
+            message = item.get("message")
+            stop_reason = message.get("stop_reason") if isinstance(message, dict) else None
+            if stop_reason == "end_turn":
+                latest_complete = timestamp
+            continue
+        if item_type == "system" and item.get("subtype") == "turn_duration":
+            latest_complete = timestamp
+    return latest_started, latest_complete
+
+
+def session_activity(session: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    if not session.get("claude_session_id"):
+        return {"state": "none", "started_at": None, "elapsed_seconds": None}
+    started_at, completed_at = transcript_task_window(resolve_session_transcript_path(session))
+    started_dt = parse_iso(started_at)
+    completed_dt = parse_iso(completed_at)
+    live = tmux_exists(session["tmux_session"])
+    if live and started_dt and (not completed_dt or started_dt > completed_dt):
+        now_dt = now or datetime.now(timezone.utc)
+        elapsed = max(0, int((now_dt - started_dt).total_seconds()))
+        return {"state": "running", "started_at": started_at, "elapsed_seconds": elapsed}
+    if session_has_unread_result(session):
+        return {"state": "unread", "started_at": None, "elapsed_seconds": None}
+    return {"state": "read", "started_at": None, "elapsed_seconds": None}
 
 
 def session_viewed_at(session: dict[str, Any]) -> str | None:
@@ -563,11 +635,16 @@ def session_has_unread_result(session: dict[str, Any]) -> bool:
 
 
 def view_state_text(session: dict[str, Any]) -> str:
+    activity = session_activity(session)
+    if activity["state"] == "running":
+        return cyan("running")
+    if activity["state"] == "unread":
+        return red("● unread")
+    if activity["state"] == "read":
+        return green("● read")
     if not session.get("claude_session_id"):
         return dim("no-result")
-    if session_has_unread_result(session):
-        return red("● unread")
-    return dim("viewed")
+    return dim("unknown")
 
 
 def normalize_preview_text(text: str | None) -> str:
@@ -652,7 +729,9 @@ def emit_json(data: dict[str, Any]) -> None:
 
 
 def session_json(session: dict[str, Any], *, include_status: bool = True) -> dict[str, Any]:
+    transcript_path = resolve_session_transcript_path(session)
     conversation_updated_at = session_conversation_updated_at(session)
+    activity = session_activity(session)
     data = {
         "id": session.get("id"),
         "name": session.get("name"),
@@ -660,13 +739,16 @@ def session_json(session: dict[str, Any], *, include_status: bool = True) -> dic
         "claude_session_id": session.get("claude_session_id"),
         "bound": bool(session.get("claude_session_id")),
         "unread": session_has_unread_result(session),
+        "activity_state": activity["state"],
+        "activity_started_at": activity["started_at"],
+        "activity_elapsed_seconds": activity["elapsed_seconds"],
         "last_viewed_at": session.get("last_viewed_at"),
         "conversation_updated_at": conversation_updated_at,
         "last_cwd": session.get("last_cwd"),
         "created_at": session.get("created_at"),
         "updated_at": session.get("updated_at"),
         "last_used_at": session.get("last_used_at"),
-        "transcript_path": session.get("transcript_path"),
+        "transcript_path": transcript_path,
     }
     if include_status:
         data["tmux_status"] = tmux_status(session)
@@ -1020,6 +1102,20 @@ def touch_last_used(session_id: str, *, mark_viewed: bool = False) -> None:
         save_registry(registry)
 
 
+def mark_session_viewed(session_id: str) -> dict[str, Any] | None:
+    with registry_lock():
+        registry = load_registry()
+        session = find_session_by_id(registry, session_id)
+        if not session:
+            return None
+        ts = now_utc()
+        session["last_used_at"] = ts
+        session["last_viewed_at"] = later_time(ts, session_conversation_updated_at(session))
+        session["updated_at"] = ts
+        save_registry(registry)
+        return dict(session)
+
+
 def enter_session(session: dict[str, Any], *, unbound_mode: str = "prompt") -> int:
     if tmux_exists(session["tmux_session"]):
         touch_last_used(session["id"], mark_viewed=True)
@@ -1241,6 +1337,23 @@ def cmd_enter(args: list[str]) -> int:
         print(f"{shlex.quote(current_ccd_path())} enter{flags} {shlex.quote(session['name'])}")
         return 0
     return enter_session(session, unbound_mode="new" if new_if_unbound else "prompt")
+
+
+def cmd_mark_viewed(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    session = resolve_session_arg(args, "标记哪个会话为已查看", noninteractive=json_mode, json_mode=json_mode)
+    if not session:
+        return 1
+    updated = mark_session_viewed(session["id"])
+    if not updated:
+        print_error("注册表中找不到该会话。", json_mode=json_mode)
+        return 1
+    if json_mode:
+        emit_json({"ok": True, "session": session_json(updated)})
+        return 0
+    print(green(f"已标记为已查看: {updated.get('name', '')}"))
+    return 0
 
 
 def cmd_delete(args: list[str]) -> int:
@@ -2051,8 +2164,7 @@ def cmd_hook_session_start(_: list[str]) -> int:
         session["claude_session_id"] = claude_id
         if cwd:
             session["last_cwd"] = cwd
-        if transcript_path:
-            session["transcript_path"] = transcript_path
+        session["transcript_path"] = transcript_path or find_claude_transcript_path(claude_id) or session.get("transcript_path")
         session["last_used_at"] = ts
         session["last_viewed_at"] = later_time(ts, session_conversation_updated_at(session))
         session["updated_at"] = ts
@@ -2116,6 +2228,7 @@ def usage() -> str:
   ccd enter [ccd_name]      进入会话
   ccd enter --new-if-unbound [ccd_name]
   ccd enter --print-command [ccd_name]
+  ccd mark-viewed --json [ccd_name]
   ccd uuid [ccd_name]       查看绑定的 Claude Code session id
   ccd uuid --all            列出所有 ccd 会话的绑定 ID
   ccd delete [--yes] [ccd_name]
@@ -2157,6 +2270,9 @@ def dispatch(argv: list[str]) -> int:
         "create": cmd_new,
         "enter": cmd_enter,
         "open": cmd_enter,
+        "mark-viewed": cmd_mark_viewed,
+        "viewed": cmd_mark_viewed,
+        "read": cmd_mark_viewed,
         "uuid": cmd_uuid,
         "id": cmd_uuid,
         "claude-id": cmd_uuid,

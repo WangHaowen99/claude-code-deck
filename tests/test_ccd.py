@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -30,6 +31,10 @@ def write_transcript(path: Path, mtime: datetime) -> None:
     path.write_text('{"type":"assistant","message":{"content":"done"}}\n', encoding="utf-8")
     timestamp = mtime.timestamp()
     os.utime(path, (timestamp, timestamp))
+
+
+def write_events(path: Path, events: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
 
 
 class CcdTests(unittest.TestCase):
@@ -271,6 +276,161 @@ class CcdTests(unittest.TestCase):
             saved["last_viewed_at"],
             self.ccd.later_time(saved["last_used_at"], self.ccd.session_conversation_updated_at(saved)),
         )
+
+    def test_mark_viewed_command_clears_unread_state(self):
+        self.ccd.ensure_dirs()
+        transcript = self.root / "session.jsonl"
+        write_transcript(transcript, datetime(2026, 5, 9, 8, 30, tzinfo=timezone.utc))
+        self.ccd.save_registry(
+            {
+                "version": self.ccd.VERSION,
+                "sessions": [
+                    {
+                        "id": "deck1",
+                        "name": "work",
+                        "tmux_session": "ccd_deck1",
+                        "claude_session_id": "claude-1",
+                        "last_cwd": str(self.root),
+                        "created_at": "2026-05-09T07:00:00Z",
+                        "updated_at": "2026-05-09T08:00:00Z",
+                        "last_used_at": "2026-05-09T08:00:00Z",
+                        "last_viewed_at": "2026-05-09T08:00:00Z",
+                        "transcript_path": str(transcript),
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(self.ccd.session_has_unread_result(self.ccd.load_registry()["sessions"][0]))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rc = self.ccd.cmd_mark_viewed(["--json", "work"])
+
+        self.assertEqual(rc, 0)
+        payload = json.loads(output.getvalue())
+        self.assertTrue(payload["ok"])
+        refreshed = self.ccd.load_registry()["sessions"][0]
+        self.assertFalse(self.ccd.session_has_unread_result(refreshed))
+        self.assertGreaterEqual(
+            self.ccd.sort_key_time(refreshed["last_viewed_at"]),
+            self.ccd.sort_key_time(self.ccd.session_conversation_updated_at(refreshed)),
+        )
+
+    def test_activity_state_reports_running_elapsed_time(self):
+        transcript = self.root / "session.jsonl"
+        write_events(
+            transcript,
+            [
+                {"timestamp": "2026-05-09T08:00:00Z", "type": "user", "message": {"role": "user", "content": "build"}},
+                {
+                    "timestamp": "2026-05-09T08:01:00Z",
+                    "type": "assistant",
+                    "message": {"role": "assistant", "stop_reason": "tool_use"},
+                },
+            ],
+        )
+        session = {
+            "id": "deck1",
+            "name": "work",
+            "tmux_session": "ccd_deck1",
+            "claude_session_id": "claude-1",
+            "transcript_path": str(transcript),
+            "last_viewed_at": "2026-05-09T07:00:00Z",
+        }
+
+        with mock.patch.object(self.ccd, "tmux_exists", return_value=True):
+            state = self.ccd.session_activity(session, now=self.ccd.parse_iso("2026-05-09T08:03:30Z"))
+
+        self.assertEqual(state["state"], "running")
+        self.assertEqual(state["started_at"], "2026-05-09T08:00:00Z")
+        self.assertEqual(state["elapsed_seconds"], 210)
+
+    def test_activity_state_falls_back_to_unread_after_turn_complete(self):
+        transcript = self.root / "session.jsonl"
+        write_events(
+            transcript,
+            [
+                {"timestamp": "2026-05-09T08:00:00Z", "type": "user", "message": {"role": "user", "content": "build"}},
+                {
+                    "timestamp": "2026-05-09T08:03:00Z",
+                    "type": "assistant",
+                    "message": {"role": "assistant", "stop_reason": "end_turn"},
+                },
+            ],
+        )
+        timestamp = self.ccd.parse_iso("2026-05-09T08:03:00Z").timestamp()
+        os.utime(transcript, (timestamp, timestamp))
+        session = {
+            "id": "deck1",
+            "name": "work",
+            "tmux_session": "ccd_deck1",
+            "claude_session_id": "claude-1",
+            "transcript_path": str(transcript),
+            "last_viewed_at": "2026-05-09T07:00:00Z",
+        }
+
+        with mock.patch.object(self.ccd, "tmux_exists", return_value=True):
+            state = self.ccd.session_activity(session, now=self.ccd.parse_iso("2026-05-09T08:04:00Z"))
+
+        self.assertEqual(state["state"], "unread")
+        self.assertIsNone(state["elapsed_seconds"])
+
+    def test_session_json_resolves_missing_transcript_path_from_claude_projects(self):
+        sid = "44444444-4444-4444-8444-444444444444"
+        transcript_dir = self.ccd.CLAUDE_PROJECTS_DIR / "-tmp"
+        transcript_dir.mkdir(parents=True)
+        transcript = transcript_dir / f"{sid}.jsonl"
+        write_transcript(transcript, datetime(2026, 5, 11, 2, 30, tzinfo=timezone.utc))
+        session = {
+            "id": "deck1",
+            "name": "work",
+            "tmux_session": "ccd_deck1",
+            "claude_session_id": sid,
+            "transcript_path": None,
+            "last_viewed_at": "2026-05-11T02:24:30Z",
+        }
+
+        with mock.patch.object(self.ccd, "tmux_exists", return_value=False):
+            data = self.ccd.session_json(session, include_status=False)
+
+        self.assertEqual(data["transcript_path"], str(transcript))
+        self.assertEqual(data["conversation_updated_at"], "2026-05-11T02:30:00Z")
+        self.assertTrue(data["unread"])
+
+    def test_hook_session_start_resolves_missing_transcript_path(self):
+        self.ccd.ensure_dirs()
+        sid = "55555555-5555-4555-8555-555555555555"
+        transcript_dir = self.ccd.CLAUDE_PROJECTS_DIR / "-tmp"
+        transcript_dir.mkdir(parents=True)
+        transcript = transcript_dir / f"{sid}.jsonl"
+        write_transcript(transcript, datetime(2026, 5, 11, 2, 30, tzinfo=timezone.utc))
+        self.ccd.save_registry(
+            {
+                "version": self.ccd.VERSION,
+                "sessions": [
+                    {
+                        "id": "deck1",
+                        "name": "work",
+                        "tmux_session": "ccd_deck1",
+                        "claude_session_id": None,
+                        "last_cwd": str(self.root),
+                        "created_at": "2026-05-11T02:24:30Z",
+                        "updated_at": "2026-05-11T02:24:30Z",
+                        "last_used_at": "2026-05-11T02:24:30Z",
+                        "last_viewed_at": "2026-05-11T02:24:30Z",
+                        "transcript_path": None,
+                    }
+                ],
+            }
+        )
+        payload = {"session_id": sid, "cwd": str(self.root), "source": "startup"}
+
+        with mock.patch.dict(os.environ, {"CCD_SESSION_ID": "deck1"}), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))):
+            rc = self.ccd.cmd_hook_session_start([])
+
+        self.assertEqual(rc, 0)
+        saved = self.ccd.load_registry()["sessions"][0]
+        self.assertEqual(saved["transcript_path"], str(transcript))
 
 
 if __name__ == "__main__":

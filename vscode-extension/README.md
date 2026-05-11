@@ -10,9 +10,13 @@ It does not reimplement Claude Code Deck. It calls the remote/workspace `ccd` co
 - `ccd delete --yes --json <ccd_name>`
 - `ccd enter <ccd_name>`
 - `ccd enter --new-if-unbound <ccd_name>`
+- `ccd mark-viewed --json <ccd_name>`
 
-Unread Claude Code results are shown in the session description. When `ccd list --json`
-reports `unread: true`, the tree item uses a red dot icon.
+Unread Claude Code results are shown with a red dot. Viewed bound sessions use a
+green dot. Running sessions show a small animated spinner and elapsed time.
+
+Opening a session marks it viewed through `ccd mark-viewed --json`, which clears
+the unread state after the terminal opens.
 
 Opening the same ccd session again reuses the existing VS Code terminal. Closing
 that terminal clears the cache, so the next open creates a fresh terminal.
