@@ -185,12 +185,12 @@ ccd install-hook          # refresh Claude Code hook
 
 Download the compiled VSIX:
 
-[claude-code-deck-0.1.1.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.1.vsix)
+[claude-code-deck-0.1.2.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.2.vsix)
 
 Install after download:
 
 ```bash
-code --install-extension claude-code-deck-0.1.1.vsix
+code --install-extension claude-code-deck-0.1.2.vsix
 ```
 
 Build from source:

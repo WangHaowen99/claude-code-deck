@@ -185,12 +185,12 @@ ccd install-hook          # 安装/刷新 Claude Code hook
 
 直接下载编译好的 VSIX：
 
-[claude-code-deck-0.1.1.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.1.vsix)
+[claude-code-deck-0.1.2.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.2.vsix)
 
 下载后安装：
 
 ```bash
-code --install-extension claude-code-deck-0.1.1.vsix
+code --install-extension claude-code-deck-0.1.2.vsix
 ```
 
 从源码编译：
