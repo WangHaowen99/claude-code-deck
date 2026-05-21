@@ -7,6 +7,9 @@ It does not reimplement Claude Code Deck. It calls the remote/workspace `ccd` co
 - `ccd list --json`
 - `ccd new --cwd <path> --no-enter --json <ccd_name>`
 - `ccd rename --json <old> <new>`
+- `ccd fork --no-enter --json <source> <new>`
+- `ccd close --yes --json <ccd_name>`
+- `ccd reopen --json <ccd_name>`
 - `ccd delete --yes --json <ccd_name>`
 - `ccd enter <ccd_name>`
 - `ccd enter --new-if-unbound <ccd_name>`

@@ -2,7 +2,7 @@
   "name": "claude-code-deck",
   "displayName": "Claude Code Deck",
   "description": "Manage Claude Code Deck sessions from the VS Code sidebar.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "claude-code-deck",
   "license": "MIT",
   "repository": {
@@ -24,6 +24,9 @@
     "onCommand:claudeCodeDeck.refresh",
     "onCommand:claudeCodeDeck.newSession",
     "onCommand:claudeCodeDeck.openSession",
+    "onCommand:claudeCodeDeck.forkSession",
+    "onCommand:claudeCodeDeck.closeSession",
+    "onCommand:claudeCodeDeck.reopenSession",
     "onCommand:claudeCodeDeck.deleteSession",
     "onCommand:claudeCodeDeck.renameSession",
     "onCommand:claudeCodeDeck.copyUuid"
@@ -79,6 +82,21 @@
         "icon": "$(terminal)"
       },
       {
+        "command": "claudeCodeDeck.forkSession",
+        "title": "Fork Session",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "claudeCodeDeck.closeSession",
+        "title": "Close Session",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "claudeCodeDeck.reopenSession",
+        "title": "Reopen Closed Session",
+        "icon": "$(history)"
+      },
+      {
         "command": "claudeCodeDeck.renameSession",
         "title": "Rename Session",
         "icon": "$(edit)"
@@ -105,6 +123,11 @@
           "command": "claudeCodeDeck.refresh",
           "when": "view == claudeCodeDeck.sessions",
           "group": "navigation@2"
+        },
+        {
+          "command": "claudeCodeDeck.reopenSession",
+          "when": "view == claudeCodeDeck.sessions",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -119,9 +142,19 @@
           "group": "navigation@1"
         },
         {
-          "command": "claudeCodeDeck.copyUuid",
+          "command": "claudeCodeDeck.forkSession",
           "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
           "group": "navigation@2"
+        },
+        {
+          "command": "claudeCodeDeck.copyUuid",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "navigation@3"
+        },
+        {
+          "command": "claudeCodeDeck.closeSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "navigation@8"
         },
         {
           "command": "claudeCodeDeck.deleteSession",

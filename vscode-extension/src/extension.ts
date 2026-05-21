@@ -85,6 +85,33 @@ class CcdClient {
     }
   }
 
+  async close (name: string): Promise<CcdSession> {
+    const stdout = await this.run(['close', '--yes', '--json', name])
+    const data = parseJson<CcdSessionResult>(stdout)
+    if (!data.ok || !data.session) {
+      throw new Error(data.error || 'ccd close failed')
+    }
+    return data.session
+  }
+
+  async reopen (name: string): Promise<CcdSession> {
+    const stdout = await this.run(['reopen', '--json', name])
+    const data = parseJson<CcdSessionResult>(stdout)
+    if (!data.ok || !data.session) {
+      throw new Error(data.error || 'ccd reopen failed')
+    }
+    return data.session
+  }
+
+  async fork (sourceName: string, newName: string): Promise<CcdSession> {
+    const stdout = await this.run(['fork', '--no-enter', '--json', sourceName, newName])
+    const data = parseJson<CcdSessionResult>(stdout)
+    if (!data.ok || !data.session) {
+      throw new Error(data.error || 'ccd fork failed')
+    }
+    return data.session
+  }
+
   async markViewed (name: string): Promise<CcdSession> {
     const stdout = await this.run(['mark-viewed', '--json', name])
     const data = parseJson<CcdSessionResult>(stdout)
@@ -187,6 +214,9 @@ export function activate (context: vscode.ExtensionContext): void {
     vscode.window.onDidCloseTerminal(terminal => terminals.deleteTerminal(terminal)),
     vscode.commands.registerCommand('claudeCodeDeck.newSession', async () => newSession(provider, terminals)),
     vscode.commands.registerCommand('claudeCodeDeck.openSession', async item => openSession(provider, terminals, item)),
+    vscode.commands.registerCommand('claudeCodeDeck.forkSession', async item => forkSession(provider, terminals, item)),
+    vscode.commands.registerCommand('claudeCodeDeck.closeSession', async item => closeSession(provider, item)),
+    vscode.commands.registerCommand('claudeCodeDeck.reopenSession', async item => reopenSession(provider, terminals, item)),
     vscode.commands.registerCommand('claudeCodeDeck.renameSession', async item => renameSession(provider, item)),
     vscode.commands.registerCommand('claudeCodeDeck.deleteSession', async item => deleteSession(provider, item)),
     vscode.commands.registerCommand('claudeCodeDeck.copyUuid', async item => copyUuid(provider, item))
@@ -259,6 +289,72 @@ async function renameSession (provider: SessionsProvider, item: unknown): Promis
     await provider.client.rename(session.name, newName.trim())
     await provider.refresh()
   })
+}
+
+async function forkSession (provider: SessionsProvider, terminals: TerminalRegistry<vscode.Terminal>, item: unknown): Promise<void> {
+  const session = await sessionFrom(provider, item, 'Fork from which Claude Code Deck session?')
+  if (!session) {
+    return
+  }
+  if (!session.claude_session_id) {
+    vscode.window.showInformationMessage(`"${session.name}" is not bound to a Claude Code session yet.`)
+    return
+  }
+  const newName = await vscode.window.showInputBox({
+    prompt: 'New ccd_name for fork',
+    value: `${session.name}-fork`,
+    ignoreFocusOut: true,
+    validateInput: value => value.trim() ? undefined : 'ccd_name is required'
+  })
+  if (!newName) {
+    return
+  }
+  const forked = await runAction('Fork Claude Code Deck session', async () => {
+    const created = await provider.client.fork(session.name, newName.trim())
+    await provider.refresh()
+    return created
+  })
+  if (forked) {
+    openTerminalFor(forked, provider.client.executable, terminals, { newIfUnbound: true })
+  }
+}
+
+async function closeSession (provider: SessionsProvider, item: unknown): Promise<void> {
+  const session = await sessionFrom(provider, item, 'Close which Claude Code Deck session?')
+  if (!session) {
+    return
+  }
+  const confirmed = await vscode.window.showWarningMessage(
+    `Close Claude Code Deck session "${session.name}"? This hides it from the active list and kills tmux if it is running. Claude Code history is preserved.`,
+    { modal: true },
+    'Close'
+  )
+  if (confirmed !== 'Close') {
+    return
+  }
+  await runAction('Close Claude Code Deck session', async () => {
+    await provider.client.close(session.name)
+    await provider.refresh()
+  })
+}
+
+async function reopenSession (provider: SessionsProvider, terminals: TerminalRegistry<vscode.Terminal>, item: unknown): Promise<void> {
+  const name = await vscode.window.showInputBox({
+    prompt: 'Closed ccd_name to reopen',
+    ignoreFocusOut: true,
+    validateInput: value => value.trim() ? undefined : 'ccd_name is required'
+  })
+  if (!name) {
+    return
+  }
+  const reopened = await runAction('Reopen Claude Code Deck session', async () => {
+    const session = await provider.client.reopen(name.trim())
+    await provider.refresh()
+    return session
+  })
+  if (reopened) {
+    openTerminalFor(reopened, provider.client.executable, terminals)
+  }
 }
 
 async function deleteSession (provider: SessionsProvider, item: unknown): Promise<void> {

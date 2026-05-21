@@ -86,8 +86,10 @@ Claude Code SessionStart hook writes back the real session id
 | Session list | Shows only ccd-managed sessions; the CLI is sorted by recent use, and the VS Code sidebar keeps stable creation-time ordering |
 | New session | Choose a root directory and optionally create a subdirectory |
 | Enter session | Attach to live tmux or resume Claude Code automatically |
+| Fork session | Create a new ccd workspace from a bound Claude Code session |
+| Close and history | Closing a session moves it to history, preserves Claude Code history, and can be restored with `ccd reopen` |
 | Unread and activity state | Shows unread results when the transcript is newer than the last viewed time; running sessions show an orange dot and elapsed time in the VS Code sidebar |
-| Mouse scrolling | Refreshes tmux mouse mode and intercepts wheel events for narrow terminals |
+| Mouse scrolling | Refreshes tmux mouse mode and intercepts wheel events for steadier narrow-terminal scrolling |
 | Session ID lookup | Show the Claude Code session id bound to a ccd workspace |
 | Delete session | Kill tmux and remove the ccd mapping, preserving Claude Code history |
 | Rename | Supports live sessions and names with spaces |
@@ -181,16 +183,16 @@ ccd install-hook          # refresh Claude Code hook
 
 ## VS Code Extension
 
-`vscode-extension/` provides a small sidebar extension for listing, creating, opening, renaming, deleting, and copying session ids.
+`vscode-extension/` provides a small sidebar extension for listing, creating, opening, forking, closing, reopening, renaming, deleting, and copying session ids.
 
 Download the compiled VSIX:
 
-[claude-code-deck-0.1.3.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.3.vsix)
+[claude-code-deck-0.1.4.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.1.4.vsix)
 
 Install after download:
 
 ```bash
-code --install-extension claude-code-deck-0.1.3.vsix
+code --install-extension claude-code-deck-0.1.4.vsix
 ```
 
 Build from source:

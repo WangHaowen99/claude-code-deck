@@ -26,6 +26,8 @@ APP_ID = "ccd"
 VERSION = 1
 MAX_NAME_LEN = 60
 RAW_IMPORT_PREVIEW_LIMIT = 30
+TMUX_HISTORY_LIMIT = 200000
+TMUX_SCROLL_LINES = 12
 CCD_HOOK_STATUS = "ccd session mapping"
 COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 ASCII_BANNER = [
@@ -402,8 +404,9 @@ def configure_tmux_session(tmux_name: str) -> None:
     configure_tmux_server()
     options = [
         ("mouse", "on"),
+        ("history-limit", str(TMUX_HISTORY_LIMIT)),
         ("remain-on-exit", "off"),
-        ("@ccd_scroll_mode", "tmux-copy-mode"),
+        ("@ccd_scroll_mode", "accelerated-copy-mode"),
     ]
     for option, value in options:
         result = subprocess.run(
@@ -433,6 +436,7 @@ def configure_tmux_server() -> None:
 def install_tmux_mouse_bindings() -> None:
     if shutil.which("tmux") is None:
         return
+    scroll_lines = str(TMUX_SCROLL_LINES)
     bindings = [
         [
             "bind-key",
@@ -443,8 +447,8 @@ def install_tmux_mouse_bindings() -> None:
             "-F",
             "-t",
             "=",
-            "#{==:#{@ccd_scroll_mode},tmux-copy-mode}",
-            "if-shell -F -t = '#{pane_in_mode}' 'send-keys -M' 'copy-mode -e -t ='",
+            "#{==:#{@ccd_scroll_mode},accelerated-copy-mode}",
+            f"if-shell -F -t = '#{{pane_in_mode}}' 'send-keys -X -N {scroll_lines} scroll-up' 'copy-mode -e -t ='",
             "if-shell -F -t = '#{||:#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M' 'copy-mode -e -t ='",
         ],
         [
@@ -456,8 +460,8 @@ def install_tmux_mouse_bindings() -> None:
             "-F",
             "-t",
             "=",
-            "#{==:#{@ccd_scroll_mode},tmux-copy-mode}",
-            "if-shell -F -t = '#{pane_in_mode}' 'send-keys -M'",
+            "#{==:#{@ccd_scroll_mode},accelerated-copy-mode}",
+            f"if-shell -F -t = '#{{pane_in_mode}}' \"if-shell -F -t = '#{{pane_at_bottom}}' 'send-keys -X cancel' 'send-keys -X -N {scroll_lines} scroll-down'\" 'send-keys -M'",
             "send-keys -M",
         ],
     ]
@@ -472,12 +476,36 @@ def install_tmux_mouse_bindings() -> None:
             log_event(f"tmux mouse binding failed: {' '.join(binding)}: {result.stderr.strip()}")
 
 
-def sorted_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+def session_is_closed(session: dict[str, Any]) -> bool:
+    return bool(session.get("closed_at"))
+
+
+def active_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return [session for session in registry.get("sessions", []) if not session_is_closed(session)]
+
+
+def closed_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return [session for session in registry.get("sessions", []) if session_is_closed(session)]
+
+
+def sort_session_list(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
-        registry.get("sessions", []),
+        sessions,
         key=lambda s: (sort_key_time(s.get("last_used_at")) or sort_key_time(s.get("created_at")), s.get("name", "")),
         reverse=True,
     )
+
+
+def sorted_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return sort_session_list(active_sessions(registry))
+
+
+def sorted_closed_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return sort_session_list(closed_sessions(registry))
+
+
+def sorted_all_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return sort_session_list(registry.get("sessions", []))
 
 
 def short_text(text: str | None, max_len: int = 28) -> str:
@@ -748,8 +776,13 @@ def session_json(session: dict[str, Any], *, include_status: bool = True) -> dic
         "created_at": session.get("created_at"),
         "updated_at": session.get("updated_at"),
         "last_used_at": session.get("last_used_at"),
+        "closed_at": session.get("closed_at"),
         "transcript_path": transcript_path,
     }
+    if session.get("fork_from_claude_session_id"):
+        data["fork_from_claude_session_id"] = session.get("fork_from_claude_session_id")
+    if session.get("fork_from_ccd_id"):
+        data["fork_from_ccd_id"] = session.get("fork_from_ccd_id")
     if include_status:
         data["tmux_status"] = tmux_status(session)
     return data
@@ -834,6 +867,40 @@ def choose_ccd_session(prompt: str = "选择 ccd 会话") -> dict[str, Any] | No
         if session.get("name") == choice:
             return session
     print(red("未找到会话。"))
+    return None
+
+
+def print_closed_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    sessions = sorted_closed_sessions(registry)
+    if not sessions:
+        print_empty("当前没有历史 ccd 会话。")
+        return []
+    print_header("历史 ccd 会话", "这些会话已关闭，可用 ccd reopen 恢复。")
+    for i, session in enumerate(sessions, start=1):
+        used = display_time(session.get("last_used_at") or session.get("created_at"))
+        closed = display_time(session.get("closed_at"))
+        name = short_text(session.get("name"), 30)
+        print(f"  {cyan(str(i).rjust(2))}  {bold(name)}")
+        print(f"      {dim('closed')}  {dim(closed)}  {dim('last used ' + used)}")
+    return sessions
+
+
+def choose_closed_ccd_session(prompt: str = "选择历史 ccd 会话") -> dict[str, Any] | None:
+    registry = load_registry()
+    sessions = print_closed_sessions(registry)
+    if not sessions:
+        return None
+    choice = globals()["prompt"](f"{prompt} [编号/名称，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(sessions):
+            return sessions[idx - 1]
+    for session in sessions:
+        if session.get("name") == choice:
+            return session
+    print(red("未找到历史会话。"))
     return None
 
 
@@ -1023,7 +1090,15 @@ def ensure_initialized() -> bool:
     return cmd_init(auto=True) == 0
 
 
-def create_record(name: str, cwd: str, claude_session_id: str | None = None, transcript_path: str | None = None) -> dict[str, Any]:
+def create_record(
+    name: str,
+    cwd: str,
+    claude_session_id: str | None = None,
+    transcript_path: str | None = None,
+    *,
+    fork_from_claude_session_id: str | None = None,
+    fork_from_ccd_id: str | None = None,
+) -> dict[str, Any]:
     with registry_lock():
         registry = load_registry()
         if find_session_by_name(registry, name):
@@ -1042,6 +1117,10 @@ def create_record(name: str, cwd: str, claude_session_id: str | None = None, tra
             "last_viewed_at": later_time(created, path_mtime_iso(transcript_path)),
             "transcript_path": transcript_path,
         }
+        if fork_from_claude_session_id:
+            session["fork_from_claude_session_id"] = fork_from_claude_session_id
+        if fork_from_ccd_id:
+            session["fork_from_ccd_id"] = fork_from_ccd_id
         registry["sessions"].append(session)
         save_registry(registry)
         log_event(f"created ccd session id={sid} name={name!r}")
@@ -1176,6 +1255,31 @@ def cmd_list(args: list[str]) -> int:
     return 0
 
 
+def cmd_history(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    if args:
+        print_error(f"未知参数: {' '.join(args)}", json_mode=json_mode)
+        return 1
+    registry = load_registry()
+    sessions = sorted_closed_sessions(registry)
+    if json_mode:
+        emit_json(
+            {
+                "ok": True,
+                "version": VERSION,
+                "sessions": [session_json(session) for session in sessions],
+            }
+        )
+        return 0
+    chosen = choose_closed_ccd_session("重新打开哪个历史会话")
+    if not chosen:
+        return 0
+    if not ask_yes_no(f"重新打开：{chosen['name']}？", default=True):
+        return 1
+    return reopen_session(chosen["id"], enter=True, json_mode=False)
+
+
 def print_uuid_detail(session: dict[str, Any]) -> int:
     print_header("Claude Code Session ID", "这是 ccd 记录的真实 Claude Code session id。")
     print(f"  ccd_name:     {bold(session.get('name', ''))}")
@@ -1203,7 +1307,7 @@ def cmd_uuid(args: list[str]) -> int:
         if args:
             print_error(f"未知参数: {' '.join(args)}", json_mode=json_mode)
             return 1
-        sessions = sorted_sessions(registry)
+        sessions = sorted_all_sessions(registry)
         if json_mode:
             emit_json(
                 {
@@ -1278,6 +1382,9 @@ def cmd_new(args: list[str]) -> int:
     registry = load_registry()
     existing = find_session_by_name(registry, name)
     if existing:
+        if session_is_closed(existing):
+            print_error(f"会话“{name}”已关闭，请使用 ccd reopen 恢复。", json_mode=json_mode)
+            return 1
         if json_mode:
             emit_json({"ok": True, "existing": True, "session": session_json(existing)})
             return 0
@@ -1310,6 +1417,63 @@ def cmd_new(args: list[str]) -> int:
     return enter_session(session, unbound_mode="new")
 
 
+def cmd_fork(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    no_enter = take_flag(args, "--no-enter") or json_mode
+    try:
+        require_tool("tmux")
+        require_tool("claude")
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    if len(args) >= 2:
+        source_name = args[0]
+        new_name = " ".join(args[1:]).strip()
+        registry = load_registry()
+        source = find_session_by_name(registry, source_name)
+        if not source:
+            print_error(f"未找到会话: {source_name}", json_mode=json_mode)
+            return 1
+    elif not args and not json_mode:
+        source = choose_ccd_session("基于哪个 ccd 会话 fork")
+        if not source:
+            return 1
+        new_name = prompt("新的 ccd_name: ")
+    else:
+        print_error("用法: ccd fork [--json] [--no-enter] SOURCE_CCD_NAME NEW_CCD_NAME", json_mode=json_mode)
+        return 1
+    if session_is_closed(source):
+        print_error(f"会话“{source.get('name', '')}”已关闭，请先 reopen。", json_mode=json_mode)
+        return 1
+    source_claude_id = source.get("claude_session_id")
+    if not source_claude_id:
+        print_error("源会话还没有绑定 Claude Code session id，不能 fork。", json_mode=json_mode)
+        return 1
+    try:
+        new_name = validate_name(new_name)
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    cwd = source.get("last_cwd") if source.get("last_cwd") and Path(source.get("last_cwd", "")).is_dir() else str(HOME)
+    try:
+        session = create_record(
+            new_name,
+            cwd,
+            fork_from_claude_session_id=source_claude_id,
+            fork_from_ccd_id=source.get("id"),
+        )
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    log_event(f"created fork ccd session id={session['id']} from ccd id={source.get('id')} claude id={source_claude_id}")
+    if json_mode:
+        emit_json({"ok": True, "session": session_json(session)})
+    if no_enter:
+        return 0
+    return enter_session(session, unbound_mode="new")
+
+
 def resolve_session_arg(args: list[str], prompt: str, *, noninteractive: bool = False, json_mode: bool = False) -> dict[str, Any] | None:
     if args:
         name = " ".join(args).strip()
@@ -1325,12 +1489,30 @@ def resolve_session_arg(args: list[str], prompt: str, *, noninteractive: bool = 
     return choose_ccd_session(prompt)
 
 
+def resolve_closed_session_arg(args: list[str], prompt: str, *, noninteractive: bool = False, json_mode: bool = False) -> dict[str, Any] | None:
+    if args:
+        name = " ".join(args).strip()
+        registry = load_registry()
+        session = find_session_by_name(registry, name)
+        if not session or not session_is_closed(session):
+            print_error(f"未找到历史会话: {name}", json_mode=json_mode)
+            return None
+        return session
+    if noninteractive:
+        print_error("缺少 ccd_name。", json_mode=json_mode)
+        return None
+    return choose_closed_ccd_session(prompt)
+
+
 def cmd_enter(args: list[str]) -> int:
     args = list(args)
     print_command = take_flag(args, "--print-command")
     new_if_unbound = take_flag(args, "--new-if-unbound")
     session = resolve_session_arg(args, "进入哪个会话", noninteractive=print_command)
     if not session:
+        return 1
+    if session_is_closed(session):
+        print_error(f"会话“{session.get('name', '')}”已关闭，请使用 ccd reopen 恢复。")
         return 1
     if print_command:
         flags = " --new-if-unbound" if new_if_unbound else ""
@@ -1354,6 +1536,101 @@ def cmd_mark_viewed(args: list[str]) -> int:
         return 0
     print(green(f"已标记为已查看: {updated.get('name', '')}"))
     return 0
+
+
+def cmd_close(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    yes = take_flag(args, "--yes")
+    noninteractive = json_mode or yes
+    session = resolve_session_arg(args, "关闭哪个会话", noninteractive=noninteractive, json_mode=json_mode)
+    if not session:
+        return 1
+    already_closed = session_is_closed(session)
+    live = tmux_exists(session["tmux_session"]) if not already_closed else False
+    if not already_closed and not yes:
+        print_header("关闭确认", "会话会移入历史，可用 ccd reopen 恢复；不会删除 Claude Code 原始历史。")
+        print(f"  会话: {bold(session['name'])}")
+        print(f"  tmux: {status_text('live') if live else dim('exited')}")
+        print()
+        print("  将执行:")
+        print("  - 从主列表隐藏，保留在历史 ccd")
+        if live:
+            print("  - tmux 正在运行，会被关闭并中断 Claude Code")
+        else:
+            print("  - tmux 未运行")
+        print("  - 保留 Claude Code session id、transcript 和指标")
+        confirm = prompt("输入完整会话名确认: ")
+        if confirm != session["name"]:
+            print(yellow("确认不匹配，已取消。"))
+            return 1
+    if live:
+        subprocess.run(["tmux", "kill-session", "-t", session["tmux_session"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_event(f"killed tmux session {session['tmux_session']} during close")
+    closed_session = dict(session)
+    if not already_closed:
+        with registry_lock():
+            registry = load_registry()
+            current = find_session_by_id(registry, session["id"])
+            if not current:
+                print_error("注册表中找不到该会话。", json_mode=json_mode)
+                return 1
+            ts = now_utc()
+            current["closed_at"] = ts
+            current["updated_at"] = ts
+            closed_session = dict(current)
+            save_registry(registry, timestamped_backup=True)
+        log_event(f"closed ccd session id={session['id']} name={session['name']!r}")
+    if json_mode:
+        emit_json(
+            {
+                "ok": True,
+                "already_closed": already_closed,
+                "killed_tmux": live,
+                "session": session_json(closed_session, include_status=False),
+            }
+        )
+        return 0
+    if already_closed:
+        print(dim("该会话已在历史中。"))
+    else:
+        print(green("已关闭，会话已移入历史。"))
+    return 0
+
+
+def reopen_session(session_id: str, *, enter: bool = False, json_mode: bool = False) -> int:
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, session_id)
+        if not current:
+            print_error("注册表中找不到该会话。", json_mode=json_mode)
+            return 1
+        if session_is_closed(current):
+            current.pop("closed_at", None)
+            ts = now_utc()
+            current["updated_at"] = ts
+            current["last_used_at"] = ts
+            save_registry(registry, timestamped_backup=True)
+        reopened = dict(current)
+    log_event(f"reopened ccd session id={session_id} name={reopened.get('name', '')!r}")
+    enter_rc = 0
+    if enter:
+        enter_rc = enter_session(reopened)
+    if json_mode:
+        emit_json({"ok": enter_rc == 0, "entered": enter, "enter_rc": enter_rc, "session": session_json(reopened)})
+    elif not enter:
+        print(green(f"已重新打开: {reopened.get('name', '')}"))
+    return enter_rc
+
+
+def cmd_reopen(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    enter = take_flag(args, "--enter")
+    session = resolve_closed_session_arg(args, "重新打开哪个历史会话", noninteractive=json_mode, json_mode=json_mode)
+    if not session:
+        return 1
+    return reopen_session(session["id"], enter=enter, json_mode=json_mode)
 
 
 def cmd_delete(args: list[str]) -> int:
@@ -2116,9 +2393,7 @@ def cmd_runner(args: list[str]) -> int:
         env["CCD_SESSION_ID"] = session["id"]
         env["CCD_NAME"] = session["name"]
         env["CCD_REGISTRY"] = str(REGISTRY_PATH)
-        args = ["claude", "--name", session["name"]]
-        if session.get("claude_session_id"):
-            args = ["claude", "--resume", session["claude_session_id"]]
+        args = claude_args_for_session(session)
         log_event(f"runner starting {' '.join(args)} for ccd id={session['id']}")
         result = subprocess.run(args, env=env)
         if result.returncode != 0:
@@ -2132,6 +2407,14 @@ def cmd_runner(args: list[str]) -> int:
         return result.returncode
     except KeyboardInterrupt:
         return 130
+
+
+def claude_args_for_session(session: dict[str, Any]) -> list[str]:
+    if session.get("claude_session_id"):
+        return ["claude", "--resume", session["claude_session_id"]]
+    if session.get("fork_from_claude_session_id"):
+        return ["claude", "--resume", session["fork_from_claude_session_id"], "--fork-session"]
+    return ["claude", "--name", session["name"]]
 
 
 def cmd_hook_session_start(_: list[str]) -> int:
@@ -2176,20 +2459,20 @@ def cmd_hook_session_start(_: list[str]) -> int:
 def main_menu() -> int:
     while True:
         registry = load_registry()
-        count = len(registry.get("sessions", []))
-        live_count = sum(1 for session in registry.get("sessions", []) if tmux_exists(session["tmux_session"]))
-        subtitle = f"{count} 个 ccd 会话 · {live_count} 个 live tmux"
+        active = active_sessions(registry)
+        history_count = len(closed_sessions(registry))
+        live_count = sum(1 for session in active if tmux_exists(session["tmux_session"]))
+        subtitle = f"{len(active)} 个 ccd 会话 · {history_count} 个历史 · {live_count} 个 live tmux"
         print_menu(
             APP_NAME,
             [
                 ("1", "进入会话", "attach 到 live tmux，或自动 resume Claude Code"),
                 ("2", "新建会话", "选择常用目录，创建一个新的 Claude Code 工作台"),
+                ("c", "关闭会话", "kill tmux，移入历史，可重新打开"),
+                ("h", "历史会话", "查看已关闭的 ccd，并可重新打开"),
                 ("3", "删除会话", "kill tmux 并删除 ccd 映射，不删 Claude Code 历史"),
                 ("4", "重命名会话", "修改用途名，live 会话也支持"),
                 ("5", "手动映射/导入", "绑定、导入、解除或转移 Claude Code 原始会话"),
-                ("6", "管理常用目录", "维护新建会话时可选的 root"),
-                ("7", "检查状态 doctor", "只报告问题，不自动修复"),
-                ("8", "查看 session id", "显示 ccd 会话绑定的 Claude Code session id"),
                 ("0", "退出", "离开 ccd 菜单"),
             ],
             subtitle,
@@ -2200,18 +2483,16 @@ def main_menu() -> int:
             cmd_enter([])
         elif choice == "2":
             cmd_new([])
+        elif choice in {"c", "C"}:
+            cmd_close([])
+        elif choice in {"h", "H"}:
+            cmd_history([])
         elif choice == "3":
             cmd_delete([])
         elif choice == "4":
             cmd_rename([])
         elif choice == "5":
             cmd_map([])
-        elif choice == "6":
-            cmd_roots([])
-        elif choice == "7":
-            cmd_doctor([])
-        elif choice == "8":
-            cmd_uuid([])
         elif choice in {"0", "q", "Q"}:
             return 0
         else:
@@ -2225,9 +2506,13 @@ def usage() -> str:
   ccd list --json           输出机器可读会话列表
   ccd new [ccd_name]        新建会话；同名则进入
   ccd new --cwd PATH --no-enter --json [ccd_name]
+  ccd fork [--no-enter] [--json] SOURCE NEW
   ccd enter [ccd_name]      进入会话
   ccd enter --new-if-unbound [ccd_name]
   ccd enter --print-command [ccd_name]
+  ccd close [--yes] [ccd_name]
+  ccd history [--json]      查看已关闭 ccd 会话
+  ccd reopen [--enter] [ccd_name]
   ccd mark-viewed --json [ccd_name]
   ccd uuid [ccd_name]       查看绑定的 Claude Code session id
   ccd uuid --all            列出所有 ccd 会话的绑定 ID
@@ -2268,8 +2553,15 @@ def dispatch(argv: list[str]) -> int:
         "new": cmd_new,
         "add": cmd_new,
         "create": cmd_new,
+        "fork": cmd_fork,
         "enter": cmd_enter,
         "open": cmd_enter,
+        "close": cmd_close,
+        "archive": cmd_close,
+        "history": cmd_history,
+        "hist": cmd_history,
+        "reopen": cmd_reopen,
+        "restore": cmd_reopen,
         "mark-viewed": cmd_mark_viewed,
         "viewed": cmd_mark_viewed,
         "read": cmd_mark_viewed,

@@ -432,6 +432,109 @@ class CcdTests(unittest.TestCase):
         saved = self.ccd.load_registry()["sessions"][0]
         self.assertEqual(saved["transcript_path"], str(transcript))
 
+    def test_closed_sessions_are_hidden_from_active_list_and_reopenable(self):
+        self.ccd.ensure_dirs()
+        self.ccd.save_registry(
+            {
+                "version": self.ccd.VERSION,
+                "sessions": [
+                    {
+                        "id": "deck1",
+                        "name": "work",
+                        "tmux_session": "ccd_deck1",
+                        "claude_session_id": "claude-1",
+                        "last_cwd": str(self.root),
+                        "created_at": "2026-05-09T00:00:00Z",
+                        "updated_at": "2026-05-09T00:00:00Z",
+                        "last_used_at": "2026-05-09T00:00:00Z",
+                        "transcript_path": None,
+                    }
+                ],
+            }
+        )
+
+        with mock.patch.object(self.ccd, "tmux_exists", return_value=False):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                close_rc = self.ccd.cmd_close(["--yes", "--json", "work"])
+            list_payload = json.loads(self.capture_stdout(lambda: self.ccd.cmd_list(["--json"])))
+            history_payload = json.loads(self.capture_stdout(lambda: self.ccd.cmd_history(["--json"])))
+            reopen_output = io.StringIO()
+            with redirect_stdout(reopen_output):
+                reopen_rc = self.ccd.cmd_reopen(["--json", "work"])
+
+        self.assertEqual(close_rc, 0)
+        self.assertEqual(reopen_rc, 0)
+        self.assertEqual(list_payload["sessions"], [])
+        self.assertEqual(history_payload["sessions"][0]["name"], "work")
+        self.assertIn("closed_at", history_payload["sessions"][0])
+        self.assertNotIn("closed_at", self.ccd.load_registry()["sessions"][0])
+
+    def test_new_refuses_closed_duplicate_name(self):
+        self.ccd.ensure_dirs()
+        self.ccd.save_registry(
+            {
+                "version": self.ccd.VERSION,
+                "sessions": [
+                    {
+                        "id": "deck1",
+                        "name": "work",
+                        "tmux_session": "ccd_deck1",
+                        "claude_session_id": "claude-1",
+                        "last_cwd": str(self.root),
+                        "created_at": "2026-05-09T00:00:00Z",
+                        "updated_at": "2026-05-09T00:00:00Z",
+                        "last_used_at": "2026-05-09T00:00:00Z",
+                        "closed_at": "2026-05-10T00:00:00Z",
+                        "transcript_path": None,
+                    }
+                ],
+            }
+        )
+
+        with mock.patch.object(self.ccd, "require_tool"), redirect_stdout(io.StringIO()):
+            rc = self.ccd.cmd_new(["--cwd", str(self.root), "--no-enter", "--json", "work"])
+
+        self.assertEqual(rc, 1)
+
+    def test_fork_creates_new_session_from_bound_source(self):
+        self.ccd.ensure_dirs()
+        self.ccd.save_registry(
+            {
+                "version": self.ccd.VERSION,
+                "sessions": [
+                    {
+                        "id": "deck1",
+                        "name": "work",
+                        "tmux_session": "ccd_deck1",
+                        "claude_session_id": "claude-1",
+                        "last_cwd": str(self.root),
+                        "created_at": "2026-05-09T00:00:00Z",
+                        "updated_at": "2026-05-09T00:00:00Z",
+                        "last_used_at": "2026-05-09T00:00:00Z",
+                        "transcript_path": None,
+                    }
+                ],
+            }
+        )
+
+        with mock.patch.object(self.ccd, "require_tool"), redirect_stdout(io.StringIO()):
+            rc = self.ccd.cmd_fork(["--no-enter", "--json", "work", "branch"])
+
+        self.assertEqual(rc, 0)
+        created = self.ccd.find_session_by_name(self.ccd.load_registry(), "branch")
+        self.assertIsNotNone(created)
+        self.assertEqual(created["fork_from_claude_session_id"], "claude-1")
+        self.assertEqual(created["fork_from_ccd_id"], "deck1")
+        self.assertEqual(self.ccd.claude_args_for_session(created), ["claude", "--resume", "claude-1", "--fork-session"])
+
+    def capture_stdout(self, fn):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rc = fn()
+        self.assertEqual(rc, 0)
+        return output.getvalue()
+
 
 if __name__ == "__main__":
     unittest.main()
