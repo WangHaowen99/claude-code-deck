@@ -1676,12 +1676,17 @@ def cmd_new(args: list[str]) -> int:
         return 1
     provider_arg: str | None = None
     model_arg: str | None = None
+    resume_arg: str | None = None
     try:
         provider_arg = take_option(args, "--provider")
     except CcdError:
         pass
     try:
         model_arg = take_option(args, "--model")
+    except CcdError:
+        pass
+    try:
+        resume_arg = take_option(args, "--resume")
     except CcdError:
         pass
     try:
@@ -1741,7 +1746,7 @@ def cmd_new(args: list[str]) -> int:
             if not provider:
                 return 1
     try:
-        session = create_record(name, cwd, provider=provider, model=model)
+        session = create_record(name, cwd, claude_session_id=resume_arg, provider=provider, model=model)
     except CcdError as exc:
         print_error(f"错误: {exc}", json_mode=json_mode)
         return 1
@@ -2795,6 +2800,23 @@ def claude_args_for_pane(session: dict[str, Any], pane_index: int) -> list[str]:
     return args
 
 
+def cmd_list_raw_sessions(_: list[str]) -> int:
+    raws = load_claude_sessions()
+    registry = load_registry()
+    bound_ids = {s.get("claude_session_id") for s in registry.get("sessions", []) if s.get("claude_session_id")}
+    result = []
+    for raw in raws[:50]:
+        result.append({
+            "id": raw.id,
+            "title": raw.title,
+            "updated_at": raw.updated_at,
+            "cwd": raw.cwd,
+            "bound": raw.id in bound_ids,
+        })
+    emit_json({"ok": True, "sessions": result})
+    return 0
+
+
 def cmd_hook_session_start(_: list[str]) -> int:
     ccd_id = os.environ.get("CCD_SESSION_ID")
     if not ccd_id:
@@ -3177,6 +3199,8 @@ def dispatch(argv: list[str]) -> int:
         return cmd_runner(rest)
     if cmd == "__hook-session-start":
         return cmd_hook_session_start(rest)
+    if cmd == "__list-raw-sessions":
+        return cmd_list_raw_sessions(rest)
     if cmd == "init":
         return cmd_init()
     if cmd == "install-hook":

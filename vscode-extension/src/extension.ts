@@ -82,13 +82,16 @@ class CcdClient {
     return data.sessions || []
   }
 
-  async create (name: string, cwd: string, provider?: string, model?: string): Promise<CcdSession> {
+  async create (name: string, cwd: string, provider?: string, model?: string, resume?: string): Promise<CcdSession> {
     const args = ['new', '--cwd', cwd, '--no-enter', '--json']
     if (provider) {
       args.push('--provider', provider)
     }
     if (model) {
       args.push('--model', model)
+    }
+    if (resume) {
+      args.push('--resume', resume)
     }
     args.push(name)
     const stdout = await this.run(args)
@@ -97,6 +100,15 @@ class CcdClient {
       throw new Error(data.error || 'ccd new failed')
     }
     return data.session
+  }
+
+  async listClaudeSessions (): Promise<{ id: string, title: string, updated_at?: string, cwd?: string, bound: boolean }[]> {
+    const stdout = await this.run(['__list-raw-sessions'])
+    const data = parseJson<{ ok: boolean, sessions: { id: string, title: string, updated_at?: string, cwd?: string, bound: boolean }[] }>(stdout)
+    if (!data.ok) {
+      throw new Error('ccd __list-raw-sessions failed')
+    }
+    return data.sessions || []
   }
 
   async rename (oldName: string, newName: string): Promise<CcdSession> {
@@ -357,8 +369,39 @@ async function newSession (provider: SessionsProvider, terminals: TerminalRegist
     }
   }
 
+  // Optional: resume from existing Claude Code session
+  let selResume: string | undefined
+  const useResume = await vscode.window.showQuickPick(['Skip (start new)', 'Resume from history...'], {
+    placeHolder: 'Resume from existing Claude Code session? (optional)',
+    ignoreFocusOut: true
+  })
+  if (useResume === 'Resume from history...') {
+    try {
+      const sessions = await runAction('Loading Claude Code sessions', () => provider.client.listClaudeSessions())
+      if (sessions && sessions.length > 0) {
+        const items = sessions.map(s => ({
+          label: s.title || s.id,
+          description: s.bound ? '(bound)' : '',
+          detail: `id: ${s.id} · ${s.cwd || ''}`,
+          id: s.id
+        }))
+        const picked = await vscode.window.showQuickPick(items, {
+          placeHolder: 'Select a Claude Code session to resume',
+          ignoreFocusOut: true,
+          matchOnDescription: true,
+          matchOnDetail: true
+        })
+        if (picked) {
+          selResume = picked.id
+        }
+      }
+    } catch {
+      // Silently skip if listing fails
+    }
+  }
+
   const session = await runAction('Create Claude Code Deck session', async () => {
-    const created = await provider.client.create(name.trim(), cwd.trim(), selProvider, selModel)
+    const created = await provider.client.create(name.trim(), cwd.trim(), selProvider, selModel, selResume)
     await provider.refresh()
     return created
   })

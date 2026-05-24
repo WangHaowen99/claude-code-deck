@@ -189,12 +189,12 @@ v0.2.2 新增：三窗口模式 + 单窗口 provider 选择，通过 claude-use 
 
 直接下载编译好的 VSIX：
 
-[claude-code-deck-0.2.2.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.2.2.vsix)
+[claude-code-deck-0.2.3.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.2.3.vsix)
 
 下载后安装：
 
 ```bash
-code --install-extension claude-code-deck-0.2.2.vsix
+code --install-extension claude-code-deck-0.2.3.vsix
 ```
 
 从源码编译：

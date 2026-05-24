@@ -2,7 +2,7 @@
   "name": "claude-code-deck",
   "displayName": "Claude Code Deck",
   "description": "Manage Claude Code Deck sessions from the VS Code sidebar.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publisher": "claude-code-deck",
   "license": "MIT",
   "repository": {
