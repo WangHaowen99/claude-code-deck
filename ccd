@@ -51,13 +51,20 @@ ASCII_BANNER_NARROW = [
 ]
 
 TRIPLE_PANE_DEFAULTS = [
-    {"provider": "anthropic", "model": "claude-sonnet-4-6"},
-    {"provider": "openai", "model": "gpt-4o"},
-    {"provider": "google", "model": "gemini-2.5-pro"},
+    {"provider": "zhipu", "model": ""},
+    {"provider": "deepseek", "model": ""},
+    {"provider": "aliyun", "model": ""},
 ]
-TRIPLE_PROVIDERS = ["anthropic", "openai", "google", "custom"]
-
+TRIPLE_PROVIDERS = [
+    "zhipu", "deepseek", "aliyun", "dashscope",
+    "aliyun-intl", "aliyun-coding", "packycode", "freemodel", "anthropic",
+]
 HOME = Path.home()
+
+CLAUDE_USE_SCRIPT = os.environ.get(
+    "CLAUDE_USE_SCRIPT",
+    str(HOME / "claude-use" / "claude-use.sh"),
+)
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
 DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state"))
@@ -1285,13 +1292,25 @@ def create_triple_tmux(session: dict[str, Any]) -> bool:
         window_name = short_text(current["name"], 30) or "ccd"
         runner = shlex.quote(current_ccd_path())
         sid = current["id"]
+        use_script = shlex.quote(CLAUDE_USE_SCRIPT)
+        panes = current.get("panes", [])
+        # Build a bash wrapper for each pane: source claude-use.sh, switch provider, then run runner
+        pane_cmds: list[str] = []
+        for pane_order in [0, 2, 1]:  # creation order: top-left, bottom, top-right
+            provider = ""
+            for p in panes:
+                if p.get("index") == pane_order:
+                    provider = p.get("provider", "")
+                    break
+            provider_switch = f"claude-use {shlex.quote(provider)}" if provider else "true"
+            pane_cmds.append(
+                f"bash -c 'source {use_script} && {provider_switch} && "
+                f"{runner} __runner {sid} --pane-index {pane_order}'"
+            )
         commands = [
-            ["tmux", "new-session", "-d", "-s", tmux_name, "-n", window_name,
-             f"{runner} __runner {sid} --pane-index 0"],
-            ["tmux", "split-window", "-v", "-l", "30%", "-t", f"{tmux_name}:0.0",
-             f"{runner} __runner {sid} --pane-index 2"],
-            ["tmux", "split-window", "-h", "-t", f"{tmux_name}:0.0",
-             f"{runner} __runner {sid} --pane-index 1"],
+            ["tmux", "new-session", "-d", "-s", tmux_name, "-n", window_name, pane_cmds[0]],
+            ["tmux", "split-window", "-v", "-l", "30%", "-t", f"{tmux_name}:0.0", pane_cmds[1]],
+            ["tmux", "split-window", "-h", "-t", f"{tmux_name}:0.0", pane_cmds[2]],
         ]
         for cmd in commands:
             result = subprocess.run(

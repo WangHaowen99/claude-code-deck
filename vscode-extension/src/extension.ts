@@ -306,12 +306,17 @@ async function newTripleSession (provider: SessionsProvider, terminals: Terminal
     return
   }
 
-  const providers = ['anthropic', 'openai', 'google', 'custom']
+  const providers = ['zhipu', 'deepseek', 'aliyun', 'dashscope', 'aliyun-intl', 'aliyun-coding', 'packycode', 'freemodel', 'anthropic']
   const defaultModels: Record<string, string> = {
-    anthropic: 'claude-sonnet-4-6',
-    openai: 'gpt-4o',
-    google: 'gemini-2.5-pro',
-    custom: ''
+    zhipu: '',
+    deepseek: '',
+    aliyun: '',
+    dashscope: '',
+    'aliyun-intl': '',
+    'aliyun-coding': '',
+    packycode: '',
+    freemodel: '',
+    anthropic: 'claude-sonnet-4-6'
   }
   const paneLabels = ['Window 1 (top-left)', 'Window 2 (top-right)', 'Window 3 (bottom)']
   const panes: { provider: string, model: string }[] = []
