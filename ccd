@@ -1332,8 +1332,10 @@ def create_triple_tmux(session: dict[str, Any]) -> bool:
                     provider = p.get("provider", "")
                     break
             provider_switch = f"claude-use {shlex.quote(provider)}" if provider else "true"
+            err_msg = f"!!! claude-use {provider} FAILED — check ~/.claude-code-providers.env"
             pane_cmds.append(
-                f"bash -c 'source {use_script}; {provider_switch} || true; "
+                f"bash -c 'source {use_script}; "
+                f"if ! {provider_switch}; then echo; echo \"{err_msg}\"; echo; sleep 3; fi; "
                 f"exec {runner} __runner {sid} --pane-index {pane_order}'"
             )
         commands = [
