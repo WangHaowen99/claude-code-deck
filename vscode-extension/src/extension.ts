@@ -136,6 +136,17 @@ class CcdClient {
     return data.session
   }
 
+  async broadcastToggle (name: string): Promise<boolean> {
+    const stdout = await this.run(['triple', 'broadcast', 'toggle', name])
+    return stdout.includes('ON')
+  }
+
+  async broadcastStatus (name: string): Promise<boolean> {
+    const stdout = await this.run(['triple', 'broadcast-status', '--json', name])
+    const data = parseJson<{ ok: boolean, enabled: boolean }>(stdout)
+    return data.ok && data.enabled
+  }
+
   async markViewed (name: string): Promise<CcdSession> {
     const stdout = await this.run(['mark-viewed', '--json', name])
     const data = parseJson<CcdSessionResult>(stdout)
@@ -174,11 +185,13 @@ class CcdClient {
 }
 
 class SessionItem extends vscode.TreeItem {
-  constructor (readonly session: CcdSession) {
+  constructor (readonly session: CcdSession, broadcastOn: boolean = false) {
     super(session.name, vscode.TreeItemCollapsibleState.None)
     this.contextValue = session.type === 'triple' ? 'ccdTripleSession' : 'ccdSession'
-    this.description = sessionDescription(session) || undefined
-    this.tooltip = tooltipFor(session)
+    const desc = sessionDescription(session) || ''
+    const bc = session.type === 'triple' && broadcastOn ? ' [BC-ON]' : ''
+    this.description = desc ? `${desc}${bc}` : (bc || undefined)
+    this.tooltip = tooltipFor(session, broadcastOn)
     this.iconPath = sessionIcon(session)
     this.command = {
       command: 'claudeCodeDeck.openSession',
@@ -200,11 +213,29 @@ class SessionsProvider implements vscode.TreeDataProvider<SessionItem> {
   }
 
   getChildren (): SessionItem[] {
-    return this.sessions.map(session => new SessionItem(session))
+    return this.sessions.map(session => new SessionItem(session, this._broadcastStates.get(session.name) ?? false))
   }
+
+  private _broadcastStates = new Map<string, boolean>()
 
   async refresh (): Promise<void> {
     this.sessions = sortSessionsForSidebar(await this.client.list())
+    // Load broadcast status for triple sessions
+    for (const session of this.sessions) {
+      if (session.type === 'triple') {
+        try {
+          const bc = await this.client.broadcastStatus(session.name)
+          this._broadcastStates.set(session.name, bc)
+        } catch {
+          this._broadcastStates.set(session.name, false)
+        }
+      }
+    }
+    this.onDidChangeTreeDataEmitter.fire()
+  }
+
+  setBroadcastState (name: string, on: boolean): void {
+    this._broadcastStates.set(name, on)
     this.onDidChangeTreeDataEmitter.fire()
   }
 
@@ -244,7 +275,8 @@ export function activate (context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('claudeCodeDeck.reopenSession', async item => reopenSession(provider, terminals, item)),
     vscode.commands.registerCommand('claudeCodeDeck.renameSession', async item => renameSession(provider, item)),
     vscode.commands.registerCommand('claudeCodeDeck.deleteSession', async item => deleteSession(provider, item)),
-    vscode.commands.registerCommand('claudeCodeDeck.copyUuid', async item => copyUuid(provider, item))
+    vscode.commands.registerCommand('claudeCodeDeck.copyUuid', async item => copyUuid(provider, item)),
+    vscode.commands.registerCommand('claudeCodeDeck.toggleBroadcast', async item => toggleBroadcast(provider, item))
   )
 
   const refreshTimer = setInterval(() => {
@@ -284,6 +316,24 @@ async function newSession (provider: SessionsProvider, terminals: TerminalRegist
   })
   if (session) {
     openTerminalFor(session, provider.client.executable, terminals, { newIfUnbound: true })
+  }
+}
+
+async function toggleBroadcast (provider: SessionsProvider, item: unknown): Promise<void> {
+  const session = await sessionFrom(provider, item, 'Toggle broadcast for which triple session?')
+  if (!session) {
+    return
+  }
+  if (session.type !== 'triple') {
+    vscode.window.showInformationMessage('Broadcast is only available for triple sessions.')
+    return
+  }
+  const enabled = await runAction('Toggle broadcast', async () => {
+    return provider.client.broadcastToggle(session.name)
+  })
+  if (enabled !== undefined) {
+    provider.setBroadcastState(session.name, enabled)
+    vscode.window.showInformationMessage(`Broadcast ${enabled ? 'ON' : 'OFF'} for "${session.name}"`)
   }
 }
 
@@ -585,12 +635,15 @@ function defaultCwd (): string {
   return folder?.uri.fsPath || os.homedir()
 }
 
-function tooltipFor (session: CcdSession): string {
+function tooltipFor (session: CcdSession, broadcastOn: boolean = false): string {
   const lines = [
     session.name,
     `status: ${viewState(session)}`,
     `type: ${session.type || 'single'}`
   ]
+  if (session.type === 'triple' && broadcastOn) {
+    lines.push('broadcast: ON')
+  }
   if (session.type === 'triple' && session.panes) {
     for (const p of session.panes) {
       const bound = p.claude_session_id ? 'bound' : 'unbound'

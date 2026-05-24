@@ -3015,6 +3015,22 @@ def cmd_triple(args: list[str]) -> int:
         return cmd_triple_close(rest)
     if sub == "broadcast":
         return cmd_triple_broadcast(rest)
+    if sub == "broadcast-status":
+        filtered = list(rest)
+        json_mode = take_flag(filtered, "--json")
+        session = resolve_session_arg(filtered, "查看哪个 triple 的广播状态", noninteractive=True, json_mode=json_mode)
+        if not session:
+            return 1
+        if session.get("type") != "triple":
+            print_error("该会话不是 triple 类型。", json_mode=json_mode)
+            return 1
+        live = tmux_exists(session["tmux_session"])
+        enabled = triple_broadcast_status(session) if live else False
+        if json_mode:
+            emit_json({"ok": True, "enabled": enabled, "live": live, "session": session["name"]})
+        else:
+            print(f"广播: {green('ON') if enabled else dim('OFF')} (tmux: {'live' if live else 'exited'})")
+        return 0
     if sub in ("list", "ls"):
         return cmd_triple_list(rest)
     if sub in ("-h", "--help", "help"):

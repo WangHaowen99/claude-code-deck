@@ -2,7 +2,7 @@
   "name": "claude-code-deck",
   "displayName": "Claude Code Deck",
   "description": "Manage Claude Code Deck sessions from the VS Code sidebar.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "claude-code-deck",
   "license": "MIT",
   "repository": {
@@ -30,7 +30,8 @@
     "onCommand:claudeCodeDeck.reopenSession",
     "onCommand:claudeCodeDeck.deleteSession",
     "onCommand:claudeCodeDeck.renameSession",
-    "onCommand:claudeCodeDeck.copyUuid"
+    "onCommand:claudeCodeDeck.copyUuid",
+    "onCommand:claudeCodeDeck.toggleBroadcast"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -116,6 +117,11 @@
         "command": "claudeCodeDeck.copyUuid",
         "title": "Copy Claude Code Session ID",
         "icon": "$(copy)"
+      },
+      {
+        "command": "claudeCodeDeck.toggleBroadcast",
+        "title": "Toggle Broadcast (Triple)",
+        "icon": "$(broadcast)"
       }
     ],
     "menus": {
@@ -186,6 +192,11 @@
           "command": "claudeCodeDeck.deleteSession",
           "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
           "group": "navigation@9"
+        },
+        {
+          "command": "claudeCodeDeck.toggleBroadcast",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdTripleSession",
+          "group": "navigation@4"
         },
         {
           "command": "claudeCodeDeck.deleteSession",
