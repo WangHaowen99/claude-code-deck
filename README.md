@@ -185,16 +185,16 @@ ccd install-hook          # 安装/刷新 Claude Code hook
 
 `vscode-extension/` 提供一个轻量侧栏扩展，用来列出、创建、打开、fork、关闭、恢复、重命名、删除和复制 session id。
 
-v0.2.1 新增：**三窗口模式**（ccd triple），一键启动 3 个 Claude Code 窗口，通过 claude-use 切换不同 provider/model，侧边栏一键切换广播输入。
+v0.2.2 新增：三窗口模式 + 单窗口 provider 选择，通过 claude-use 切换不同 API 供应商和模型，侧边栏一键广播。
 
 直接下载编译好的 VSIX：
 
-[claude-code-deck-0.2.1.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.2.1.vsix)
+[claude-code-deck-0.2.2.vsix](https://github.com/WangHaowen99/claude-code-deck/raw/develop/dist/claude-code-deck-0.2.2.vsix)
 
 下载后安装：
 
 ```bash
-code --install-extension claude-code-deck-0.2.1.vsix
+code --install-extension claude-code-deck-0.2.2.vsix
 ```
 
 从源码编译：

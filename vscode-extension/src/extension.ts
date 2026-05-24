@@ -53,6 +53,19 @@ interface CcdSessionResult {
   session?: CcdSession
 }
 
+const PROVIDERS_LIST = ['zhipu', 'deepseek', 'aliyun', 'dashscope', 'aliyun-intl', 'aliyun-coding', 'packycode', 'freemodel', 'anthropic']
+const PROVIDER_MODELS: Record<string, string[]> = {
+  zhipu: ['glm-5.1'],
+  deepseek: ['deepseek-v4-pro[1m]', 'deepseek-v4-pro', 'deepseek-v4-flash'],
+  aliyun: ['qwen3.6-plus', 'qwen3.6-flash'],
+  dashscope: ['qwen3.6-plus', 'qwen3.6-flash'],
+  'aliyun-intl': ['qwen3.6-plus'],
+  'aliyun-coding': ['qwen3.6-plus'],
+  packycode: ['claude-opus-4-7'],
+  freemodel: ['opus[1m]'],
+  anthropic: ['claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-7']
+}
+
 class CcdClient {
   constructor (private readonly output: vscode.OutputChannel) {}
 
@@ -69,8 +82,16 @@ class CcdClient {
     return data.sessions || []
   }
 
-  async create (name: string, cwd: string): Promise<CcdSession> {
-    const stdout = await this.run(['new', '--cwd', cwd, '--no-enter', '--json', name])
+  async create (name: string, cwd: string, provider?: string, model?: string): Promise<CcdSession> {
+    const args = ['new', '--cwd', cwd, '--no-enter', '--json']
+    if (provider) {
+      args.push('--provider', provider)
+    }
+    if (model) {
+      args.push('--model', model)
+    }
+    args.push(name)
+    const stdout = await this.run(args)
     const data = parseJson<CcdSessionResult>(stdout)
     if (!data.ok || !data.session) {
       throw new Error(data.error || 'ccd new failed')
@@ -309,8 +330,35 @@ async function newSession (provider: SessionsProvider, terminals: TerminalRegist
     return
   }
 
+  // Optional: select provider
+  const useProvider = await vscode.window.showQuickPick(['Skip (use default)', 'Select provider...'], {
+    placeHolder: 'Use claude-use provider? (optional)',
+    ignoreFocusOut: true
+  })
+  let selProvider: string | undefined
+  let selModel: string | undefined
+  if (useProvider === 'Select provider...') {
+    const provPick = await vscode.window.showQuickPick(
+      PROVIDERS_LIST.map(p => ({ label: p })),
+      { placeHolder: 'Select provider', ignoreFocusOut: true }
+    )
+    if (provPick) {
+      selProvider = provPick.label
+      const models = PROVIDER_MODELS[selProvider] || []
+      if (models.length > 0) {
+        const modelPick = await vscode.window.showQuickPick(
+          models.map(m => ({ label: m })),
+          { placeHolder: `Select model for ${selProvider}`, ignoreFocusOut: true }
+        )
+        if (modelPick) {
+          selModel = modelPick.label
+        }
+      }
+    }
+  }
+
   const session = await runAction('Create Claude Code Deck session', async () => {
-    const created = await provider.client.create(name.trim(), cwd.trim())
+    const created = await provider.client.create(name.trim(), cwd.trim(), selProvider, selModel)
     await provider.refresh()
     return created
   })
@@ -356,24 +404,12 @@ async function newTripleSession (provider: SessionsProvider, terminals: Terminal
     return
   }
 
-  const providers = ['zhipu', 'deepseek', 'aliyun', 'dashscope', 'aliyun-intl', 'aliyun-coding', 'packycode', 'freemodel', 'anthropic']
-  const providerModels: Record<string, string[]> = {
-    zhipu: ['glm-5.1'],
-    deepseek: ['deepseek-v4-pro[1m]', 'deepseek-v4-pro', 'deepseek-v4-flash'],
-    aliyun: ['qwen3.6-plus', 'qwen3.6-flash'],
-    dashscope: ['qwen3.6-plus', 'qwen3.6-flash'],
-    'aliyun-intl': ['qwen3.6-plus'],
-    'aliyun-coding': ['qwen3.6-plus'],
-    packycode: ['claude-opus-4-7'],
-    freemodel: ['opus[1m]'],
-    anthropic: ['claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-7']
-  }
   const paneLabels = ['Window 1 (top-left)', 'Window 2 (top-right)', 'Window 3 (bottom)']
   const panes: { provider: string, model: string }[] = []
 
   for (let i = 0; i < 3; i++) {
     const provPick = await vscode.window.showQuickPick(
-      providers.map(p => ({ label: p })),
+      PROVIDERS_LIST.map(p => ({ label: p })),
       {
         placeHolder: `${paneLabels[i]}: Select provider`,
         ignoreFocusOut: true
@@ -383,7 +419,7 @@ async function newTripleSession (provider: SessionsProvider, terminals: Terminal
       return
     }
     const provider = provPick.label
-    const models = providerModels[provider] || []
+    const models = PROVIDER_MODELS[provider] || []
     let model: string
     if (models.length > 0) {
       const modelPick = await vscode.window.showQuickPick(

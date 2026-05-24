@@ -829,6 +829,10 @@ def session_json(session: dict[str, Any], *, include_status: bool = True) -> dic
             }
             for p in session["panes"]
         ]
+    if session.get("provider"):
+        data["provider"] = session["provider"]
+    if session.get("model"):
+        data["model"] = session["model"]
     if include_status:
         data["tmux_status"] = tmux_status(session)
     return data
@@ -1091,6 +1095,39 @@ def configure_triple_panes() -> list[dict[str, str]] | None:
             print(red("无效选项。"))
 
 
+def _choose_single_provider() -> str | None:
+    """Pick a single provider from the claude-use list."""
+    print()
+    print(cyan("--- 选择 Provider ---"))
+    for j, p in enumerate(TRIPLE_PROVIDERS, 1):
+        print(f"  {cyan(str(j))}  {p}")
+    print(rule())
+    choice = prompt(f"提供商 [1-{len(TRIPLE_PROVIDERS)}，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(TRIPLE_PROVIDERS):
+        return TRIPLE_PROVIDERS[int(choice) - 1]
+    return None
+
+
+def _choose_single_model(provider: str) -> str | None:
+    """Pick a model for the given provider."""
+    models = TRIPLE_PROVIDER_MODELS.get(provider, [])
+    if not models:
+        return prompt(f"模型名 [{provider}]: ") or None
+    print()
+    print(cyan(f"--- 选择模型 ({provider}) ---"))
+    for j, m in enumerate(models, 1):
+        print(f"  {cyan(str(j))}  {m}")
+    print(rule())
+    choice = prompt(f"模型 [1-{len(models)}，空取消]: ")
+    if not choice:
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(models):
+        return models[int(choice) - 1]
+    return None
+
+
 def current_ccd_path() -> str:
     arg0 = Path(sys.argv[0])
     if arg0.is_absolute() and arg0.exists():
@@ -1198,6 +1235,8 @@ def create_record(
     *,
     fork_from_claude_session_id: str | None = None,
     fork_from_ccd_id: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     with registry_lock():
         registry = load_registry()
@@ -1205,7 +1244,7 @@ def create_record(
             raise CcdError(f"会话已存在: {name}")
         sid = unique_session_id(registry)
         created = now_utc()
-        session = {
+        session: dict[str, Any] = {
             "id": sid,
             "name": name,
             "tmux_session": f"ccd_{sid}",
@@ -1221,6 +1260,10 @@ def create_record(
             session["fork_from_claude_session_id"] = fork_from_claude_session_id
         if fork_from_ccd_id:
             session["fork_from_ccd_id"] = fork_from_ccd_id
+        if provider:
+            session["provider"] = provider
+        if model:
+            session["model"] = model
         registry["sessions"].append(session)
         save_registry(registry)
         log_event(f"created ccd session id={sid} name={name!r}")
@@ -1279,7 +1322,19 @@ def create_tmux_if_needed(session: dict[str, Any]) -> bool:
             configure_tmux_session(tmux_name)
             return True
         window_name = short_text(current["name"], 30) or "ccd"
-        command = f"{shlex.quote(current_ccd_path())} __runner {shlex.quote(current['id'])}"
+        runner = shlex.quote(current_ccd_path())
+        sid = current["id"]
+        provider = current.get("provider")
+        if provider:
+            use_script = shlex.quote(CLAUDE_USE_SCRIPT)
+            user_home = os.environ.get("HOME", str(HOME))
+            command = (
+                f"bash -c 'export HOME={shlex.quote(user_home)}; source {use_script}; "
+                f"claude-use {shlex.quote(provider)} || true; "
+                f"exec {runner} __runner {sid}'"
+            )
+        else:
+            command = f"{runner} __runner {sid}"
         result = subprocess.run(
             ["tmux", "new-session", "-d", "-s", tmux_name, "-n", window_name, command],
             text=True,
@@ -1619,6 +1674,16 @@ def cmd_new(args: list[str]) -> int:
     except CcdError as exc:
         print_error(f"错误: {exc}", json_mode=json_mode)
         return 1
+    provider_arg: str | None = None
+    model_arg: str | None = None
+    try:
+        provider_arg = take_option(args, "--provider")
+    except CcdError:
+        pass
+    try:
+        model_arg = take_option(args, "--model")
+    except CcdError:
+        pass
     try:
         require_tool("tmux")
         require_tool("claude")
@@ -1663,8 +1728,20 @@ def cmd_new(args: list[str]) -> int:
         cwd = choose_session_directory()
         if not cwd:
             return 1
+    provider: str | None = None
+    model: str | None = None
+    if provider_arg:
+        provider = provider_arg
+        model = model_arg
+    elif not no_enter:
+        if ask_yes_no("使用 claude-use 切换 provider？", default=False):
+            provider = _choose_single_provider()
+            if provider:
+                model = _choose_single_model(provider)
+            if not provider:
+                return 1
     try:
-        session = create_record(name, cwd)
+        session = create_record(name, cwd, provider=provider, model=model)
     except CcdError as exc:
         print_error(f"错误: {exc}", json_mode=json_mode)
         return 1
@@ -2695,6 +2772,8 @@ def claude_args_for_session(session: dict[str, Any]) -> list[str]:
         args = ["claude", "--resume", session["fork_from_claude_session_id"], "--fork-session"]
     else:
         args = ["claude", "--name", session["name"]]
+    if session.get("model"):
+        args.extend(["--model", session["model"]])
     args.extend(["--effort", "max"])
     return args
 
