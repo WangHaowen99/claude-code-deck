@@ -50,6 +50,13 @@ ASCII_BANNER_NARROW = [
     "     |____/ \\___|\\___|_|\\_\\ ",
 ]
 
+TRIPLE_PANE_DEFAULTS = [
+    {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+    {"provider": "openai", "model": "gpt-4o"},
+    {"provider": "google", "model": "gemini-2.5-pro"},
+]
+TRIPLE_PROVIDERS = ["anthropic", "openai", "google", "custom"]
+
 HOME = Path.home()
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
 DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share"))
@@ -743,11 +750,20 @@ def print_sessions(registry: dict[str, Any]) -> list[dict[str, Any]]:
     print_header("ccd 会话", "按最近使用时间排序；live 表示 tmux 现场仍在运行；● unread 表示有未查看结果。")
     for i, session in enumerate(sessions, start=1):
         status = tmux_status(session)
-        bound = "bound" if session.get("claude_session_id") else "unbound"
         used = display_time(session.get("last_used_at") or session.get("created_at"))
         name = short_text(session.get("name"), 30)
-        print(f"  {cyan(str(i).rjust(2))}  {bold(name)}")
-        print(f"      {status_text(status)}  {status_text(bound)}  {view_state_text(session)}  {dim(used)}")
+        if session.get("type") == "triple":
+            stype = green("triple")
+            pane_info = " | ".join(
+                f"{p.get('provider','?')}:{p.get('model','?')}"
+                for p in session.get("panes", [])[:3]
+            )
+            print(f"  {cyan(str(i).rjust(2))}  {bold(name)}  {stype}")
+            print(f"      {status_text(status)}  {dim(pane_info)}  {dim(used)}")
+        else:
+            bound = "bound" if session.get("claude_session_id") else "unbound"
+            print(f"  {cyan(str(i).rjust(2))}  {bold(name)}")
+            print(f"      {status_text(status)}  {status_text(bound)}  {view_state_text(session)}  {dim(used)}")
     return sessions
 
 
@@ -783,6 +799,18 @@ def session_json(session: dict[str, Any], *, include_status: bool = True) -> dic
         data["fork_from_claude_session_id"] = session.get("fork_from_claude_session_id")
     if session.get("fork_from_ccd_id"):
         data["fork_from_ccd_id"] = session.get("fork_from_ccd_id")
+    if session.get("type") == "triple" and session.get("panes"):
+        data["type"] = "triple"
+        data["panes"] = [
+            {
+                "index": p["index"],
+                "provider": p["provider"],
+                "model": p["model"],
+                "claude_session_id": p.get("claude_session_id"),
+                "bound": bool(p.get("claude_session_id")),
+            }
+            for p in session["panes"]
+        ]
     if include_status:
         data["tmux_status"] = tmux_status(session)
     return data
@@ -991,6 +1019,42 @@ def choose_session_directory() -> str | None:
     return str(final_path.resolve(strict=False))
 
 
+def configure_triple_panes() -> list[dict[str, str]] | None:
+    """Interactively configure provider/model for 3 panes."""
+    panes = [dict(p) for p in TRIPLE_PANE_DEFAULTS]
+    while True:
+        print_header("配置三个 Claude Code 窗口", "为每个窗口选择提供商和模型，空回车使用默认值。")
+        for i, pane in enumerate(panes):
+            label = ["窗口 1 (左上)", "窗口 2 (右上)", "窗口 3 (下方)"][i]
+            print(f"  {cyan(str(i+1))}  {bold(label)}")
+            print(f"      提供商: {green(pane['provider']):20s}  模型: {green(pane['model'])}")
+        print(rule())
+        print(f"  {cyan('[4]')}  {bold('全部确认，创建会话')}")
+        print(f"  {cyan('[0]')}  取消")
+        choice = prompt("请选择 [1-4, 0 取消]: ")
+        if choice == "0":
+            return None
+        if choice == "4":
+            return panes
+        if choice in ("1", "2", "3"):
+            idx = int(choice) - 1
+            pane = panes[idx]
+            label = ["窗口 1 (左上)", "窗口 2 (右上)", "窗口 3 (下方)"][idx]
+            print()
+            print(cyan(f"--- 配置 {label} ---"))
+            print(f"  当前: provider={pane['provider']}, model={pane['model']}")
+            print(f"  可选提供商: {', '.join(TRIPLE_PROVIDERS)}")
+            prov = prompt(f"提供商 [{pane['provider']}]: ")
+            if prov:
+                pane["provider"] = prov
+            model = prompt(f"模型名 [{pane['model']}]: ")
+            if model:
+                pane["model"] = model
+            print(green(f"已更新: {pane['provider']} / {pane['model']}"))
+        else:
+            print(red("无效选项。"))
+
+
 def current_ccd_path() -> str:
     arg0 = Path(sys.argv[0])
     if arg0.is_absolute() and arg0.exists():
@@ -1127,6 +1191,45 @@ def create_record(
         return session
 
 
+def create_triple_record(
+    name: str,
+    cwd: str,
+    panes_config: list[dict[str, str]],
+) -> dict[str, Any]:
+    with registry_lock():
+        registry = load_registry()
+        if find_session_by_name(registry, name):
+            raise CcdError(f"会话已存在: {name}")
+        sid = unique_session_id(registry)
+        created = now_utc()
+        session: dict[str, Any] = {
+            "id": sid,
+            "name": name,
+            "type": "triple",
+            "tmux_session": f"ccd_{sid}",
+            "claude_session_id": None,
+            "last_cwd": cwd,
+            "created_at": created,
+            "updated_at": created,
+            "last_used_at": created,
+            "last_viewed_at": created,
+            "transcript_path": None,
+            "panes": [],
+        }
+        for i, pc in enumerate(panes_config):
+            session["panes"].append({
+                "index": i,
+                "provider": pc.get("provider", "anthropic"),
+                "model": pc.get("model", ""),
+                "claude_session_id": None,
+                "transcript_path": None,
+            })
+        registry["sessions"].append(session)
+        save_registry(registry)
+        log_event(f"created triple ccd session id={sid} name={name!r}")
+        return session
+
+
 def create_tmux_if_needed(session: dict[str, Any]) -> bool:
     require_tool("tmux")
     require_tool("claude")
@@ -1167,6 +1270,95 @@ def attach_tmux(session: dict[str, Any]) -> int:
     return result.returncode
 
 
+def create_triple_tmux(session: dict[str, Any]) -> bool:
+    require_tool("tmux")
+    require_tool("claude")
+    tmux_name = session["tmux_session"]
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, session["id"])
+        if not current:
+            raise CcdError("注册表中找不到该会话。")
+        if tmux_exists(tmux_name):
+            configure_tmux_session(tmux_name)
+            return True
+        window_name = short_text(current["name"], 30) or "ccd"
+        runner = shlex.quote(current_ccd_path())
+        sid = current["id"]
+        commands = [
+            ["tmux", "new-session", "-d", "-s", tmux_name, "-n", window_name,
+             f"{runner} __runner {sid} --pane-index 0"],
+            ["tmux", "split-window", "-v", "-l", "30%", "-t", f"{tmux_name}:0.0",
+             f"{runner} __runner {sid} --pane-index 2"],
+            ["tmux", "split-window", "-h", "-t", f"{tmux_name}:0.0",
+             f"{runner} __runner {sid} --pane-index 1"],
+        ]
+        for cmd in commands:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                print(f"创建 triple tmux 失败: {result.stderr.strip() or result.stdout.strip()}")
+                subprocess.run(["tmux", "kill-session", "-t", tmux_name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return False
+        configure_tmux_session(tmux_name)
+        configure_triple_tmux_options(tmux_name)
+        log_event(f"created triple tmux session {tmux_name} for ccd id={sid}")
+        return True
+
+
+def configure_triple_tmux_options(tmux_name: str) -> None:
+    if shutil.which("tmux") is None:
+        return
+    subprocess.run(
+        ["tmux", "set-window-option", "-t", f"{tmux_name}:0", "synchronize-panes", "off"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    toggle_cmd = (
+        f"if-shell -F -t {tmux_name}:0 '#{{synchronize-panes}}' "
+        f"'set-window-option -t {tmux_name}:0 synchronize-panes off; display-message \"Broadcast OFF\"' "
+        f"'set-window-option -t {tmux_name}:0 synchronize-panes on; display-message \"Broadcast ON\"'"
+    )
+    subprocess.run(
+        ["tmux", "bind-key", "-t", tmux_name, "C-b", "run-shell", toggle_cmd],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def triple_broadcast_toggle(session: dict[str, Any], state: str | None = None) -> bool:
+    tmux_name = session["tmux_session"]
+    if state is None:
+        result = subprocess.run(
+            ["tmux", "show-window-options", "-t", f"{tmux_name}:0", "synchronize-panes"],
+            capture_output=True, text=True,
+        )
+        current = "on" in result.stdout
+        state = "off" if current else "on"
+    subprocess.run(
+        ["tmux", "set-window-option", "-t", f"{tmux_name}:0", "synchronize-panes", state],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    status_msg = f"Broadcast {'ON' if state == 'on' else 'OFF'}"
+    subprocess.run(
+        ["tmux", "display-message", "-t", tmux_name, status_msg],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    log_event(f"triple broadcast {state} for {tmux_name}")
+    return state == "on"
+
+
+def triple_broadcast_status(session: dict[str, Any]) -> bool:
+    result = subprocess.run(
+        ["tmux", "show-window-options", "-t", f"{session['tmux_session']}:0", "synchronize-panes"],
+        capture_output=True, text=True,
+    )
+    return "on" in result.stdout
+
+
 def touch_last_used(session_id: str, *, mark_viewed: bool = False) -> None:
     with registry_lock():
         registry = load_registry()
@@ -1195,7 +1387,22 @@ def mark_session_viewed(session_id: str) -> dict[str, Any] | None:
         return dict(session)
 
 
+def enter_triple_session(session: dict[str, Any]) -> int:
+    """Enter a triple session; rebuild tmux if needed."""
+    if tmux_exists(session["tmux_session"]):
+        touch_last_used(session["id"], mark_viewed=True)
+        return attach_tmux(session)
+    if not ensure_last_cwd(session):
+        return 1
+    touch_last_used(session["id"], mark_viewed=True)
+    if not create_triple_tmux(session):
+        return 1
+    return attach_tmux(session)
+
+
 def enter_session(session: dict[str, Any], *, unbound_mode: str = "prompt") -> int:
+    if session.get("type") == "triple":
+        return enter_triple_session(session)
     if tmux_exists(session["tmux_session"]):
         touch_last_used(session["id"], mark_viewed=True)
         return attach_tmux(session)
@@ -2374,6 +2581,23 @@ def cmd_runner(args: list[str]) -> int:
     if not args:
         print("missing ccd id", file=sys.stderr)
         return 2
+    pane_index: int | None = None
+    filtered: list[str] = []
+    skip = False
+    for i, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if arg == "--pane-index" and i + 1 < len(args):
+            try:
+                pane_index = int(args[i + 1])
+            except ValueError:
+                print(f"invalid --pane-index value: {args[i+1]}", file=sys.stderr)
+                return 2
+            skip = True
+            continue
+        filtered.append(arg)
+    args = filtered
     session_id = args[0]
     try:
         registry = load_registry()
@@ -2393,9 +2617,13 @@ def cmd_runner(args: list[str]) -> int:
         env["CCD_SESSION_ID"] = session["id"]
         env["CCD_NAME"] = session["name"]
         env["CCD_REGISTRY"] = str(REGISTRY_PATH)
-        args = claude_args_for_session(session)
-        log_event(f"runner starting {' '.join(args)} for ccd id={session['id']}")
-        result = subprocess.run(args, env=env)
+        if session.get("type") == "triple" and pane_index is not None:
+            env["CCD_PANE_INDEX"] = str(pane_index)
+            claude_args = claude_args_for_pane(session, pane_index)
+        else:
+            claude_args = claude_args_for_session(session)
+        log_event(f"runner starting {' '.join(claude_args)} for ccd id={session['id']} pane={pane_index}")
+        result = subprocess.run(claude_args, env=env)
         if result.returncode != 0:
             log_event(f"runner claude exited rc={result.returncode} ccd id={session['id']}")
             print(f"\nClaude Code 退出码：{result.returncode}")
@@ -2417,10 +2645,28 @@ def claude_args_for_session(session: dict[str, Any]) -> list[str]:
     return ["claude", "--name", session["name"]]
 
 
+def claude_args_for_pane(session: dict[str, Any], pane_index: int) -> list[str]:
+    panes = session.get("panes", [])
+    if pane_index < len(panes):
+        pane = panes[pane_index]
+    else:
+        return ["claude"]
+    args: list[str] = ["claude"]
+    if pane.get("model"):
+        args.extend(["--model", pane["model"]])
+    if pane.get("claude_session_id"):
+        args.extend(["--resume", pane["claude_session_id"]])
+    else:
+        args.extend(["--name", f"{session['name']}-{pane.get('provider', 'p')}{pane_index}"])
+    return args
+
+
 def cmd_hook_session_start(_: list[str]) -> int:
     ccd_id = os.environ.get("CCD_SESSION_ID")
     if not ccd_id:
         return 0
+    pane_index_str = os.environ.get("CCD_PANE_INDEX")
+    pane_index = int(pane_index_str) if pane_index_str is not None else None
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError as exc:
@@ -2439,20 +2685,31 @@ def cmd_hook_session_start(_: list[str]) -> int:
         if not session:
             log_event(f"hook ccd session not found ccd_id={ccd_id} claude_id={claude_id}")
             return 0
-        existing = session.get("claude_session_id")
-        if existing and existing != claude_id:
-            log_event(f"hook conflict ccd_id={ccd_id} existing={existing} incoming={claude_id} source={source}")
-            return 0
         ts = now_utc()
-        session["claude_session_id"] = claude_id
+        if pane_index is not None and session.get("type") == "triple":
+            panes = session.get("panes", [])
+            if pane_index < len(panes):
+                pane = panes[pane_index]
+                existing = pane.get("claude_session_id")
+                if existing and existing != claude_id:
+                    log_event(f"hook conflict ccd_id={ccd_id} pane={pane_index} existing={existing} incoming={claude_id}")
+                    return 0
+                pane["claude_session_id"] = claude_id
+                pane["transcript_path"] = transcript_path or find_claude_transcript_path(claude_id) or pane.get("transcript_path")
+        else:
+            existing = session.get("claude_session_id")
+            if existing and existing != claude_id:
+                log_event(f"hook conflict ccd_id={ccd_id} existing={existing} incoming={claude_id} source={source}")
+                return 0
+            session["claude_session_id"] = claude_id
+            session["transcript_path"] = transcript_path or find_claude_transcript_path(claude_id) or session.get("transcript_path")
         if cwd:
             session["last_cwd"] = cwd
-        session["transcript_path"] = transcript_path or find_claude_transcript_path(claude_id) or session.get("transcript_path")
         session["last_used_at"] = ts
         session["last_viewed_at"] = later_time(ts, session_conversation_updated_at(session))
         session["updated_at"] = ts
         save_registry(registry)
-    log_event(f"hook mapped ccd_id={ccd_id} claude_id={claude_id} source={source}")
+    log_event(f"hook mapped ccd_id={ccd_id} claude_id={claude_id} pane={pane_index} source={source}")
     return 0
 
 
@@ -2499,6 +2756,232 @@ def main_menu() -> int:
             print(red("无效选项。"))
 
 
+def cmd_triple_new(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    no_enter = take_flag(args, "--no-enter") or json_mode
+    try:
+        cwd_arg = take_option(args, "--cwd")
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    try:
+        require_tool("tmux")
+        require_tool("claude")
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    pane_overrides: dict[int, dict[str, str]] = {}
+    filtered_args: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--pane" and i + 1 < len(args):
+            try:
+                parts = args[i + 1].split(":", 2)
+                pane_idx = int(parts[0])
+                provider = parts[1] if len(parts) > 1 else "anthropic"
+                model = parts[2] if len(parts) > 2 else ""
+                pane_overrides[pane_idx] = {"provider": provider, "model": model}
+            except (ValueError, IndexError):
+                print_error(f"无效的 --pane 格式: {args[i+1]}，应为 INDEX:PROVIDER:MODEL", json_mode=json_mode)
+                return 1
+            i += 2
+            continue
+        filtered_args.append(args[i])
+        i += 1
+    args = filtered_args
+    if args:
+        name = " ".join(args).strip()
+    elif no_enter:
+        print_error("缺少 ccd_name。", json_mode=json_mode)
+        return 1
+    else:
+        name = prompt("ccd_name: ")
+    try:
+        name = validate_name(name)
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    registry = load_registry()
+    existing = find_session_by_name(registry, name)
+    if existing:
+        if session_is_closed(existing):
+            print_error(f"会话“{name}”已关闭，请使用 ccd reopen 恢复。", json_mode=json_mode)
+            return 1
+        if json_mode:
+            emit_json({"ok": True, "existing": True, "session": session_json(existing)})
+            return 0
+        print(cyan(f"会话“{name}”已存在，直接进入。"))
+        if no_enter:
+            return 0
+        return enter_session(existing)
+    if cwd_arg is not None:
+        try:
+            cwd = ensure_cwd_path(cwd_arg)
+        except (CcdError, OSError) as exc:
+            print_error(f"错误: {exc}", json_mode=json_mode)
+            return 1
+    else:
+        if no_enter:
+            print_error("非交互新建会话需要 --cwd。", json_mode=json_mode)
+            return 1
+        cwd = choose_session_directory()
+        if not cwd:
+            return 1
+    if pane_overrides:
+        panes_config = [
+            pane_overrides.get(j, TRIPLE_PANE_DEFAULTS[j])
+            for j in range(3)
+        ]
+    elif json_mode:
+        panes_config = TRIPLE_PANE_DEFAULTS
+    else:
+        panes_config = configure_triple_panes()
+        if panes_config is None:
+            print(dim("已取消。"))
+            return 1
+    try:
+        session = create_triple_record(name, cwd, panes_config)
+    except CcdError as exc:
+        print_error(f"错误: {exc}", json_mode=json_mode)
+        return 1
+    if json_mode:
+        emit_json({"ok": True, "existing": False, "session": session_json(session)})
+    if no_enter:
+        return 0
+    return enter_triple_session(session)
+
+
+def cmd_triple_enter(args: list[str]) -> int:
+    session = resolve_session_arg(args, "进入哪个 triple 会话")
+    if not session:
+        return 1
+    if session.get("type") != "triple":
+        print_error("该会话不是 triple 类型，请使用 ccd enter。")
+        return 1
+    if session_is_closed(session):
+        print_error(f"会话“{session.get('name', '')}”已关闭，请使用 ccd reopen 恢复。")
+        return 1
+    return enter_triple_session(session)
+
+
+def cmd_triple_close(args: list[str]) -> int:
+    args = list(args)
+    json_mode = take_flag(args, "--json")
+    yes = take_flag(args, "--yes")
+    session = resolve_session_arg(args, "关闭哪个 triple 会话", noninteractive=json_mode or yes, json_mode=json_mode)
+    if not session:
+        return 1
+    if session.get("type") != "triple":
+        print_error("该会话不是 triple 类型，请使用 ccd close。", json_mode=json_mode)
+        return 1
+    already_closed = session_is_closed(session)
+    live = tmux_exists(session["tmux_session"]) if not already_closed else False
+    if not already_closed and not yes:
+        print_header("关闭确认", "会话会移入历史，可用 ccd reopen 恢复。")
+        print(f"  会话: {bold(session['name'])}")
+        print(f"  tmux: {status_text('live') if live else dim('exited')}")
+        for p in session.get("panes", []):
+            bound = "bound" if p.get("claude_session_id") else "unbound"
+            print(f"  窗口 {p['index']}: {p['provider']}/{p['model']}  {status_text(bound)}")
+        print(rule())
+        if not ask_yes_no("确定关闭？", default=False):
+            return 0
+    if live:
+        subprocess.run(["tmux", "kill-session", "-t", session["tmux_session"]],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with registry_lock():
+        registry = load_registry()
+        current = find_session_by_id(registry, session["id"])
+        if current:
+            current["closed_at"] = now_utc()
+            current["updated_at"] = now_utc()
+            save_registry(registry)
+    log_event(f"closed triple session id={session['id']}")
+    if json_mode:
+        emit_json({"ok": True, "closed": True, "session": session_json(session)})
+        return 0
+    print(green(f"已关闭: {session['name']}"))
+    return 0
+
+
+def cmd_triple_broadcast(args: list[str]) -> int:
+    state_arg: str | None = None
+    filtered: list[str] = []
+    for arg in args:
+        if arg in ("on", "off", "toggle"):
+            state_arg = arg
+        else:
+            filtered.append(arg)
+    session = resolve_session_arg(filtered, "切换哪个 triple 的广播")
+    if not session:
+        return 1
+    if session.get("type") != "triple":
+        print_error("该会话不是 triple 类型。")
+        return 1
+    if not tmux_exists(session["tmux_session"]):
+        print_error("tmux 会话不在运行中，请先 ccd enter。")
+        return 1
+    enabled = triple_broadcast_toggle(session, state_arg)
+    label = green("ON") if enabled else dim("OFF")
+    print(f"广播: {label}")
+    return 0
+
+
+def cmd_triple_list(args: list[str]) -> int:
+    json_mode = take_flag(list(args), "--json")
+    registry = load_registry()
+    triples = [s for s in registry.get("sessions", []) if s.get("type") == "triple"]
+    if json_mode:
+        emit_json({"ok": True, "sessions": [session_json(s) for s in triples]})
+        return 0
+    if not triples:
+        print_empty("当前没有 triple 会话。")
+        return 0
+    print_header("triple 会话", f"{len(triples)} 个 triple 会话")
+    for i, session in enumerate(triples, start=1):
+        status = tmux_status(session)
+        used = display_time(session.get("last_used_at") or session.get("created_at"))
+        name = short_text(session.get("name"), 30)
+        pane_info = " | ".join(
+            f"{p.get('provider','?')}:{p.get('model','?')}"
+            for p in session.get("panes", [])[:3]
+        )
+        bc_status = triple_broadcast_status(session) if tmux_exists(session["tmux_session"]) else False
+        bc_label = "BC-ON" if bc_status else "BC-OFF"
+        print(f"  {cyan(str(i).rjust(2))}  {bold(name)}")
+        print(f"      {status_text(status)}  {dim(bc_label)}  {dim(pane_info)}  {dim(used)}")
+    return 0
+
+
+def cmd_triple(args: list[str]) -> int:
+    if not args:
+        return cmd_triple_list([])
+    sub = args[0]
+    rest = args[1:]
+    if sub == "new":
+        return cmd_triple_new(rest)
+    if sub == "enter":
+        return cmd_triple_enter(rest)
+    if sub == "close":
+        return cmd_triple_close(rest)
+    if sub == "broadcast":
+        return cmd_triple_broadcast(rest)
+    if sub in ("list", "ls"):
+        return cmd_triple_list(rest)
+    if sub in ("-h", "--help", "help"):
+        print("""ccd triple 用法:
+  ccd triple new <name>              交互式创建 triple 会话
+  ccd triple new --cwd PATH --no-enter --json <name>
+  ccd triple enter <name>            进入 triple 会话
+  ccd triple close [--yes] <name>    关闭 triple 会话
+  ccd triple broadcast <name> [on|off|toggle]
+  ccd triple list                    列出 triple 会话""")
+        return 0
+    print_error(f"未知 triple 子命令: {sub}")
+    return 1
+
+
 def usage() -> str:
     return """用法:
   ccd                       打开菜单
@@ -2523,6 +3006,11 @@ def usage() -> str:
   ccd doctor                只报告状态问题
   ccd init                  初始化并安装 hook
   ccd install-hook          安装/刷新 Claude Code hook
+  ccd triple new <name>     新建 triple 会话 (3 窗口同时运行)
+  ccd triple enter <name>   进入 triple 会话
+  ccd triple close <name>   关闭 triple 会话
+  ccd triple broadcast <name> [on|off]  切换广播输入
+  ccd triple list           列出 triple 会话
 """
 
 
@@ -2579,6 +3067,7 @@ def dispatch(argv: list[str]) -> int:
         "root": cmd_roots,
         "map": cmd_map,
         "import": lambda a: map_import(),
+        "triple": cmd_triple,
     }
     handler = commands.get(cmd)
     if not handler:

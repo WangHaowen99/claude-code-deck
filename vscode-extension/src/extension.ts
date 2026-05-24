@@ -11,6 +11,14 @@ import {
   sortSessionsForSidebar
 } from './sessionView'
 
+interface CcdPane {
+  index: number
+  provider: string
+  model: string
+  claude_session_id?: string | null
+  bound?: boolean
+}
+
 interface CcdSession {
   id: string
   name: string
@@ -29,6 +37,8 @@ interface CcdSession {
   last_used_at?: string | null
   transcript_path?: string | null
   tmux_status?: string
+  type?: string | null
+  panes?: CcdPane[]
 }
 
 interface CcdListResult {
@@ -112,6 +122,20 @@ class CcdClient {
     return data.session
   }
 
+  async createTriple (name: string, cwd: string, panes: { provider: string, model: string }[]): Promise<CcdSession> {
+    const args = ['triple', 'new', '--cwd', cwd, '--no-enter', '--json']
+    panes.forEach((p, i) => {
+      args.push('--pane', `${i}:${p.provider}:${p.model}`)
+    })
+    args.push(name)
+    const stdout = await this.run(args)
+    const data = parseJson<CcdSessionResult>(stdout)
+    if (!data.ok || !data.session) {
+      throw new Error(data.error || 'ccd triple new failed')
+    }
+    return data.session
+  }
+
   async markViewed (name: string): Promise<CcdSession> {
     const stdout = await this.run(['mark-viewed', '--json', name])
     const data = parseJson<CcdSessionResult>(stdout)
@@ -152,7 +176,7 @@ class CcdClient {
 class SessionItem extends vscode.TreeItem {
   constructor (readonly session: CcdSession) {
     super(session.name, vscode.TreeItemCollapsibleState.None)
-    this.contextValue = 'ccdSession'
+    this.contextValue = session.type === 'triple' ? 'ccdTripleSession' : 'ccdSession'
     this.description = sessionDescription(session) || undefined
     this.tooltip = tooltipFor(session)
     this.iconPath = sessionIcon(session)
@@ -213,6 +237,7 @@ export function activate (context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('claudeCodeDeck.refresh', async () => runAction('Refresh Claude Code Deck', () => provider.refresh())),
     vscode.window.onDidCloseTerminal(terminal => terminals.deleteTerminal(terminal)),
     vscode.commands.registerCommand('claudeCodeDeck.newSession', async () => newSession(provider, terminals)),
+    vscode.commands.registerCommand('claudeCodeDeck.newTripleSession', async () => newTripleSession(provider, terminals)),
     vscode.commands.registerCommand('claudeCodeDeck.openSession', async item => openSession(provider, terminals, item)),
     vscode.commands.registerCommand('claudeCodeDeck.forkSession', async item => forkSession(provider, terminals, item)),
     vscode.commands.registerCommand('claudeCodeDeck.closeSession', async item => closeSession(provider, item)),
@@ -254,6 +279,70 @@ async function newSession (provider: SessionsProvider, terminals: TerminalRegist
 
   const session = await runAction('Create Claude Code Deck session', async () => {
     const created = await provider.client.create(name.trim(), cwd.trim())
+    await provider.refresh()
+    return created
+  })
+  if (session) {
+    openTerminalFor(session, provider.client.executable, terminals, { newIfUnbound: true })
+  }
+}
+
+async function newTripleSession (provider: SessionsProvider, terminals: TerminalRegistry<vscode.Terminal>): Promise<void> {
+  const name = await vscode.window.showInputBox({
+    prompt: 'Triple ccd_name',
+    ignoreFocusOut: true,
+    validateInput: value => value.trim() ? undefined : 'ccd_name is required'
+  })
+  if (!name) {
+    return
+  }
+  const cwd = await vscode.window.showInputBox({
+    prompt: 'Working directory on the remote/workspace host',
+    value: defaultCwd(),
+    ignoreFocusOut: true,
+    validateInput: value => value.trim() ? undefined : 'Working directory is required'
+  })
+  if (!cwd) {
+    return
+  }
+
+  const providers = ['anthropic', 'openai', 'google', 'custom']
+  const defaultModels: Record<string, string> = {
+    anthropic: 'claude-sonnet-4-6',
+    openai: 'gpt-4o',
+    google: 'gemini-2.5-pro',
+    custom: ''
+  }
+  const paneLabels = ['Window 1 (top-left)', 'Window 2 (top-right)', 'Window 3 (bottom)']
+  const panes: { provider: string, model: string }[] = []
+
+  for (let i = 0; i < 3; i++) {
+    const provPick = await vscode.window.showQuickPick(
+      providers.map(p => ({ label: p, description: i === 0 && p === 'anthropic' ? 'default' : '' })),
+      {
+        placeHolder: `${paneLabels[i]}: Select provider`,
+        ignoreFocusOut: true
+      }
+    )
+    if (!provPick) {
+      return
+    }
+    const provider = provPick.label
+    const defaultModel = defaultModels[provider] || ''
+    const model = await vscode.window.showInputBox({
+      prompt: `${paneLabels[i]}: Model name for ${provider}`,
+      value: defaultModel,
+      ignoreFocusOut: true,
+      validateInput: value => value.trim() ? undefined : 'Model name is required'
+    })
+    if (!model) {
+      return
+    }
+    panes.push({ provider, model: model.trim() })
+  }
+
+  const session = await runAction('Create triple Claude Code Deck session', async () => {
+    const created = await provider.client.createTriple(name.trim(), cwd.trim(), panes)
     await provider.refresh()
     return created
   })
@@ -422,8 +511,8 @@ function openTerminalFor (
   })
   terminals.set(terminalKey, terminal)
   terminal.show()
-  const args = ['enter']
-  if (options.newIfUnbound) {
+  const args = session.type === 'triple' ? ['triple', 'enter'] : ['enter']
+  if (options.newIfUnbound && session.type !== 'triple') {
     args.push('--new-if-unbound')
   }
   args.push(session.name)
@@ -479,8 +568,15 @@ function defaultCwd (): string {
 function tooltipFor (session: CcdSession): string {
   const lines = [
     session.name,
-    `status: ${viewState(session)}`
+    `status: ${viewState(session)}`,
+    `type: ${session.type || 'single'}`
   ]
+  if (session.type === 'triple' && session.panes) {
+    for (const p of session.panes) {
+      const bound = p.claude_session_id ? 'bound' : 'unbound'
+      lines.push(`  pane ${p.index}: ${p.provider}/${p.model} (${bound})`)
+    }
+  }
   if (isRunning(session)) {
     lines.push(`elapsed: ${formatElapsed(runningElapsedSeconds(session))}`)
   }
@@ -500,6 +596,9 @@ function tooltipFor (session: CcdSession): string {
 }
 
 function sessionIcon (session: CcdSession): vscode.ThemeIcon {
+  if (session.type === 'triple') {
+    return new vscode.ThemeIcon('layout')
+  }
   const statusIcon = sessionStatusIcon(session)
   if (statusIcon) {
     return new vscode.ThemeIcon(statusIcon.codicon, new vscode.ThemeColor(statusIcon.color))

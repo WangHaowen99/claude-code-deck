@@ -2,7 +2,7 @@
   "name": "claude-code-deck",
   "displayName": "Claude Code Deck",
   "description": "Manage Claude Code Deck sessions from the VS Code sidebar.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "claude-code-deck",
   "license": "MIT",
   "repository": {
@@ -23,6 +23,7 @@
     "onView:claudeCodeDeck.sessions",
     "onCommand:claudeCodeDeck.refresh",
     "onCommand:claudeCodeDeck.newSession",
+    "onCommand:claudeCodeDeck.newTripleSession",
     "onCommand:claudeCodeDeck.openSession",
     "onCommand:claudeCodeDeck.forkSession",
     "onCommand:claudeCodeDeck.closeSession",
@@ -77,6 +78,11 @@
         "icon": "$(add)"
       },
       {
+        "command": "claudeCodeDeck.newTripleSession",
+        "title": "New Triple Session (3 Models)",
+        "icon": "$(split-horizontal)"
+      },
+      {
         "command": "claudeCodeDeck.openSession",
         "title": "Open Session",
         "icon": "$(terminal)"
@@ -120,14 +126,19 @@
           "group": "navigation@1"
         },
         {
-          "command": "claudeCodeDeck.refresh",
+          "command": "claudeCodeDeck.newTripleSession",
           "when": "view == claudeCodeDeck.sessions",
           "group": "navigation@2"
         },
         {
-          "command": "claudeCodeDeck.reopenSession",
+          "command": "claudeCodeDeck.refresh",
           "when": "view == claudeCodeDeck.sessions",
           "group": "navigation@3"
+        },
+        {
+          "command": "claudeCodeDeck.reopenSession",
+          "when": "view == claudeCodeDeck.sessions",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -137,8 +148,18 @@
           "group": "inline@1"
         },
         {
+          "command": "claudeCodeDeck.openSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdTripleSession",
+          "group": "inline@1"
+        },
+        {
           "command": "claudeCodeDeck.renameSession",
           "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeCodeDeck.renameSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdTripleSession",
           "group": "navigation@1"
         },
         {
@@ -157,8 +178,18 @@
           "group": "navigation@8"
         },
         {
+          "command": "claudeCodeDeck.closeSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdTripleSession",
+          "group": "navigation@8"
+        },
+        {
           "command": "claudeCodeDeck.deleteSession",
           "when": "view == claudeCodeDeck.sessions && viewItem == ccdSession",
+          "group": "navigation@9"
+        },
+        {
+          "command": "claudeCodeDeck.deleteSession",
+          "when": "view == claudeCodeDeck.sessions && viewItem == ccdTripleSession",
           "group": "navigation@9"
         }
       ]
