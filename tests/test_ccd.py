@@ -199,7 +199,7 @@ class CcdTests(unittest.TestCase):
             rc = self.ccd.cmd_runner(["deck1"])
 
         self.assertEqual(rc, 0)
-        self.assertEqual(seen[0][0], ["claude", "--resume", sid])
+        self.assertEqual(seen[0][0], ["claude", "--resume", sid, "--effort", "max"])
         self.assertEqual(seen[0][1]["CCD_SESSION_ID"], "deck1")
 
     def test_unbound_session_is_never_unread(self):
@@ -526,7 +526,7 @@ class CcdTests(unittest.TestCase):
         self.assertIsNotNone(created)
         self.assertEqual(created["fork_from_claude_session_id"], "claude-1")
         self.assertEqual(created["fork_from_ccd_id"], "deck1")
-        self.assertEqual(self.ccd.claude_args_for_session(created), ["claude", "--resume", "claude-1", "--fork-session"])
+        self.assertEqual(self.ccd.claude_args_for_session(created), ["claude", "--resume", "claude-1", "--fork-session", "--effort", "max"])
 
     def capture_stdout(self, fn):
         output = io.StringIO()

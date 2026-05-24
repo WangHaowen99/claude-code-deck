@@ -2690,10 +2690,13 @@ def cmd_runner(args: list[str]) -> int:
 
 def claude_args_for_session(session: dict[str, Any]) -> list[str]:
     if session.get("claude_session_id"):
-        return ["claude", "--resume", session["claude_session_id"]]
-    if session.get("fork_from_claude_session_id"):
-        return ["claude", "--resume", session["fork_from_claude_session_id"], "--fork-session"]
-    return ["claude", "--name", session["name"]]
+        args = ["claude", "--resume", session["claude_session_id"]]
+    elif session.get("fork_from_claude_session_id"):
+        args = ["claude", "--resume", session["fork_from_claude_session_id"], "--fork-session"]
+    else:
+        args = ["claude", "--name", session["name"]]
+    args.extend(["--effort", "max"])
+    return args
 
 
 def claude_args_for_pane(session: dict[str, Any], pane_index: int) -> list[str]:
@@ -2705,6 +2708,7 @@ def claude_args_for_pane(session: dict[str, Any], pane_index: int) -> list[str]:
     args: list[str] = ["claude"]
     if pane.get("model"):
         args.extend(["--model", pane["model"]])
+    args.extend(["--effort", "max"])
     if pane.get("claude_session_id"):
         args.extend(["--resume", pane["claude_session_id"]])
     else:
