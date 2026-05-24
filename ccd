@@ -2750,6 +2750,7 @@ def cmd_runner(args: list[str]) -> int:
         env["CCD_SESSION_ID"] = session["id"]
         env["CCD_NAME"] = session["name"]
         env["CCD_REGISTRY"] = str(REGISTRY_PATH)
+        env["IS_SANDBOX"] = "1"
         if session.get("type") == "triple" and pane_index is not None:
             env["CCD_PANE_INDEX"] = str(pane_index)
             claude_args = claude_args_for_pane(session, pane_index)
