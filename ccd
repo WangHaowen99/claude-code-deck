@@ -2806,7 +2806,7 @@ def cmd_list_raw_sessions(_: list[str]) -> int:
     registry = load_registry()
     bound_ids = {s.get("claude_session_id") for s in registry.get("sessions", []) if s.get("claude_session_id")}
     result = []
-    for raw in raws[:50]:
+    for raw in raws:
         result.append({
             "id": raw.id,
             "title": raw.title,
