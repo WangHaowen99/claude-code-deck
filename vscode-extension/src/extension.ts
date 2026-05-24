@@ -379,12 +379,15 @@ async function newSession (provider: SessionsProvider, terminals: TerminalRegist
     try {
       const sessions = await runAction('Loading Claude Code sessions', () => provider.client.listClaudeSessions())
       if (sessions && sessions.length > 0) {
-        const items = sessions.map(s => ({
-          label: s.title || s.id,
-          description: s.bound ? '(bound)' : '',
-          detail: `id: ${s.id} · ${s.cwd || ''}`,
-          id: s.id
-        }))
+        const items = sessions.map(s => {
+          const timeStr = s.updated_at ? formatSessionTime(s.updated_at) : ''
+          return {
+            label: s.title || s.id,
+            description: `${timeStr}${s.bound ? ' · bound' : ''}`,
+            detail: `id: ${s.id} · ${s.cwd || ''}`,
+            id: s.id
+          }
+        })
         const picked = await vscode.window.showQuickPick(items, {
           placeHolder: 'Select a Claude Code session to resume',
           ignoreFocusOut: true,
@@ -771,6 +774,31 @@ function viewState (session: CcdSession): string {
 
 function isSession (value: unknown): value is CcdSession {
   return Boolean(value && typeof value === 'object' && 'name' in value && 'id' in value)
+}
+
+function formatSessionTime (iso: string): string {
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) {
+    return ''
+  }
+  const now = new Date()
+  const diffMs = now.getTime() - d.getTime()
+  const diffMin = Math.floor(diffMs / 60000)
+  const diffHour = Math.floor(diffMs / 3600000)
+  if (diffMin < 1) {
+    return 'just now'
+  }
+  if (diffMin < 60) {
+    return `${diffMin}m ago`
+  }
+  if (diffHour < 24) {
+    return `${diffHour}h ago`
+  }
+  const month = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  const hour = String(d.getHours()).padStart(2, '0')
+  const min = String(d.getMinutes()).padStart(2, '0')
+  return `${month}-${day} ${hour}:${min}`
 }
 
 function shellQuote (value: string): string {
