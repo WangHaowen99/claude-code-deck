@@ -307,23 +307,23 @@ async function newTripleSession (provider: SessionsProvider, terminals: Terminal
   }
 
   const providers = ['zhipu', 'deepseek', 'aliyun', 'dashscope', 'aliyun-intl', 'aliyun-coding', 'packycode', 'freemodel', 'anthropic']
-  const defaultModels: Record<string, string> = {
-    zhipu: '',
-    deepseek: '',
-    aliyun: '',
-    dashscope: '',
-    'aliyun-intl': '',
-    'aliyun-coding': '',
-    packycode: '',
-    freemodel: '',
-    anthropic: 'claude-sonnet-4-6'
+  const providerModels: Record<string, string[]> = {
+    zhipu: ['glm-5.1'],
+    deepseek: ['deepseek-v4-pro[1m]', 'deepseek-v4-pro', 'deepseek-v4-flash'],
+    aliyun: ['qwen3.6-plus', 'qwen3.6-flash'],
+    dashscope: ['qwen3.6-plus', 'qwen3.6-flash'],
+    'aliyun-intl': ['qwen3.6-plus'],
+    'aliyun-coding': ['qwen3.6-plus'],
+    packycode: ['claude-opus-4-7'],
+    freemodel: ['opus[1m]'],
+    anthropic: ['claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-7']
   }
   const paneLabels = ['Window 1 (top-left)', 'Window 2 (top-right)', 'Window 3 (bottom)']
   const panes: { provider: string, model: string }[] = []
 
   for (let i = 0; i < 3; i++) {
     const provPick = await vscode.window.showQuickPick(
-      providers.map(p => ({ label: p, description: i === 0 && p === 'anthropic' ? 'default' : '' })),
+      providers.map(p => ({ label: p })),
       {
         placeHolder: `${paneLabels[i]}: Select provider`,
         ignoreFocusOut: true
@@ -333,17 +333,32 @@ async function newTripleSession (provider: SessionsProvider, terminals: Terminal
       return
     }
     const provider = provPick.label
-    const defaultModel = defaultModels[provider] || ''
-    const model = await vscode.window.showInputBox({
-      prompt: `${paneLabels[i]}: Model name for ${provider}`,
-      value: defaultModel,
-      ignoreFocusOut: true,
-      validateInput: value => value.trim() ? undefined : 'Model name is required'
-    })
-    if (!model) {
-      return
+    const models = providerModels[provider] || []
+    let model: string
+    if (models.length > 0) {
+      const modelPick = await vscode.window.showQuickPick(
+        models.map(m => ({ label: m })),
+        {
+          placeHolder: `${paneLabels[i]}: Select model for ${provider}`,
+          ignoreFocusOut: true
+        }
+      )
+      if (!modelPick) {
+        return
+      }
+      model = modelPick.label
+    } else {
+      const input = await vscode.window.showInputBox({
+        prompt: `${paneLabels[i]}: Model name for ${provider}`,
+        ignoreFocusOut: true,
+        validateInput: value => value.trim() ? undefined : 'Model name is required'
+      })
+      if (!input) {
+        return
+      }
+      model = input.trim()
     }
-    panes.push({ provider, model: model.trim() })
+    panes.push({ provider, model })
   }
 
   const session = await runAction('Create triple Claude Code Deck session', async () => {

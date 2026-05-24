@@ -51,14 +51,25 @@ ASCII_BANNER_NARROW = [
 ]
 
 TRIPLE_PANE_DEFAULTS = [
-    {"provider": "zhipu", "model": ""},
-    {"provider": "deepseek", "model": ""},
-    {"provider": "aliyun", "model": ""},
+    {"provider": "zhipu", "model": "glm-5.1"},
+    {"provider": "deepseek", "model": "deepseek-v4-pro[1m]"},
+    {"provider": "aliyun", "model": "qwen3.6-plus"},
 ]
 TRIPLE_PROVIDERS = [
     "zhipu", "deepseek", "aliyun", "dashscope",
     "aliyun-intl", "aliyun-coding", "packycode", "freemodel", "anthropic",
 ]
+TRIPLE_PROVIDER_MODELS: dict[str, list[str]] = {
+    "zhipu": ["glm-5.1"],
+    "deepseek": ["deepseek-v4-pro[1m]", "deepseek-v4-pro", "deepseek-v4-flash"],
+    "aliyun": ["qwen3.6-plus", "qwen3.6-flash"],
+    "dashscope": ["qwen3.6-plus", "qwen3.6-flash"],
+    "aliyun-intl": ["qwen3.6-plus"],
+    "aliyun-coding": ["qwen3.6-plus"],
+    "packycode": ["claude-opus-4-7"],
+    "freemodel": ["opus[1m]"],
+    "anthropic": ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-7"],
+}
 HOME = Path.home()
 
 CLAUDE_USE_SCRIPT = os.environ.get(
@@ -1050,13 +1061,31 @@ def configure_triple_panes() -> list[dict[str, str]] | None:
             print()
             print(cyan(f"--- 配置 {label} ---"))
             print(f"  当前: provider={pane['provider']}, model={pane['model']}")
-            print(f"  可选提供商: {', '.join(TRIPLE_PROVIDERS)}")
-            prov = prompt(f"提供商 [{pane['provider']}]: ")
-            if prov:
-                pane["provider"] = prov
-            model = prompt(f"模型名 [{pane['model']}]: ")
-            if model:
-                pane["model"] = model
+            # Provider picker
+            print(f"  可选提供商:")
+            for j, p in enumerate(TRIPLE_PROVIDERS, 1):
+                print(f"    {cyan(str(j))}  {p}")
+            prov_choice = prompt(f"提供商 [1-{len(TRIPLE_PROVIDERS)}，空保留 {pane['provider']}]: ")
+            if prov_choice and prov_choice.isdigit() and 1 <= int(prov_choice) <= len(TRIPLE_PROVIDERS):
+                new_prov = TRIPLE_PROVIDERS[int(prov_choice) - 1]
+                if new_prov != pane["provider"]:
+                    pane["provider"] = new_prov
+                    # Auto-pick first model for new provider
+                    models = TRIPLE_PROVIDER_MODELS.get(new_prov, [])
+                    pane["model"] = models[0] if models else ""
+            # Model picker
+            models = TRIPLE_PROVIDER_MODELS.get(pane["provider"], [])
+            if models:
+                print(f"  可选模型 ({pane['provider']}):")
+                for j, m in enumerate(models, 1):
+                    print(f"    {cyan(str(j))}  {m}")
+                m_choice = prompt(f"模型 [1-{len(models)}，空保留 {pane['model']}]: ")
+                if m_choice and m_choice.isdigit() and 1 <= int(m_choice) <= len(models):
+                    pane["model"] = models[int(m_choice) - 1]
+            else:
+                model = prompt(f"模型名 [{pane['model']}]: ")
+                if model:
+                    pane["model"] = model
             print(green(f"已更新: {pane['provider']} / {pane['model']}"))
         else:
             print(red("无效选项。"))
@@ -1304,8 +1333,8 @@ def create_triple_tmux(session: dict[str, Any]) -> bool:
                     break
             provider_switch = f"claude-use {shlex.quote(provider)}" if provider else "true"
             pane_cmds.append(
-                f"bash -c 'source {use_script} && {provider_switch} && "
-                f"{runner} __runner {sid} --pane-index {pane_order}'"
+                f"bash -c 'source {use_script}; {provider_switch} || true; "
+                f"exec {runner} __runner {sid} --pane-index {pane_order}'"
             )
         commands = [
             ["tmux", "new-session", "-d", "-s", tmux_name, "-n", window_name, pane_cmds[0]],
